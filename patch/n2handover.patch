@@ -35,6 +35,27 @@ index 656bbc6..a2f6135 100644
      }
  }
  
+diff --git a/src/gnb/gnb.cpp b/src/gnb/gnb.cpp
+index a9a0a88..a2956d0 100644
+--- a/src/gnb/gnb.cpp
++++ b/src/gnb/gnb.cpp
+@@ -15,6 +15,7 @@
+ #include "sctp/task.hpp"
+ 
+ #include <lib/app/cli_base.hpp>
++#include <lib/ho/events.hpp>
+ 
+ namespace nr::gnb
+ {
+@@ -27,6 +28,8 @@ GNodeB::GNodeB(GnbConfig *config, app::INodeListener *nodeListener, NtsTask *cli
+     base->nodeListener = nodeListener;
+     base->cliCallbackTask = cliCallbackTask;
+ 
++    ho::EventLog::Instance().initialize(config->name);
++
+     base->appTask = new GnbAppTask(base);
+     base->sctpTask = new SctpTask(base);
+     base->ngapTask = new NgapTask(base);
 diff --git a/src/gnb/gtp/task.cpp b/src/gnb/gtp/task.cpp
 index 0475dcb..47b02d9 100644
 --- a/src/gnb/gtp/task.cpp
@@ -75,12 +96,45 @@ index 0475dcb..47b02d9 100644
      m_sessionTree.insert(sessionInd, session->downTunnel.teid);
  
      updateAmbrForUe(session->ueId);
+diff --git a/src/gnb/ngap/context.cpp b/src/gnb/ngap/context.cpp
+index 95a43cf..863c40f 100644
+--- a/src/gnb/ngap/context.cpp
++++ b/src/gnb/ngap/context.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <gnb/gtp/task.hpp>
+ #include <gnb/rrc/task.hpp>
++#include <lib/ho/events.hpp>
+ 
+ #include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
+ #include <asn/ngap/ASN_NGAP_AssociatedQosFlowItem.h>
+@@ -236,6 +237,20 @@ void NgapTask::receiveContextRelease(int amfId, ASN_NGAP_UEContextReleaseCommand
+     if (ue == nullptr)
+         return;
+ 
++    {
++        ho::HoEvent event{};
++        event.hoId = ue->hoId;
++        event.role = ue->hoAsSource ? ho::EventRole::Source : ho::EventRole::Target;
++        event.phase = ho::EventPhase::UeCtxReleaseReceived;
++        event.nci = m_base->config->nci;
++        event.ueId = ue->ctxId;
++        event.sti = ue->sti;
++        event.ranNgapId = ue->ranUeNgapId;
++        event.amfUeNgapId = ue->amfUeNgapId;
++        event.sessions.assign(ue->pduSessions.begin(), ue->pduSessions.end());
++        ho::EventLog::Instance().emit(event);
++    }
++
+     // Notify RRC task
+     auto w1 = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::AN_RELEASE);
+     w1->ueId = ue->ctxId;
 diff --git a/src/gnb/ngap/handover.cpp b/src/gnb/ngap/handover.cpp
 new file mode 100644
-index 0000000..69ffc24
+index 0000000..f6447c7
 --- /dev/null
 +++ b/src/gnb/ngap/handover.cpp
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,797 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -105,11 +159,13 @@ index 0000000..69ffc24
 +#include "utils.hpp"
 +
 +#include <stdexcept>
++#include <utility>
 +#include <vector>
 +
 +#include <gnb/gtp/task.hpp>
 +#include <gnb/nts.hpp>
 +#include <gnb/rrc/task.hpp>
++#include <lib/ho/events.hpp>
 +#include <lib/ho/ho.hpp>
 +#include <utils/common.hpp>
 +
@@ -155,6 +211,32 @@ index 0000000..69ffc24
 +    if (idLength < 22 || idLength > 32)
 +        return 0;
 +    return static_cast<uint64_t>(gnbId) << (36 - idLength);
++}
++
++static std::vector<int> SessionsOf(const NgapUeContext *ue)
++{
++    if (ue == nullptr)
++        return {};
++    return std::vector<int>(ue->pduSessions.begin(), ue->pduSessions.end());
++}
++
++static ho::HoEvent MakeEvent(ho::EventRole role, ho::EventPhase phase, uint64_t hoId, const NgapUeContext *ue,
++                             int64_t nci, std::vector<int> sessions)
++{
++    ho::HoEvent event{};
++    event.hoId = hoId;
++    event.role = role;
++    event.phase = phase;
++    event.nci = nci;
++    if (ue != nullptr)
++    {
++        event.ueId = ue->ctxId;
++        event.sti = ue->sti;
++        event.ranNgapId = ue->ranUeNgapId;
++        event.amfUeNgapId = ue->amfUeNgapId;
++    }
++    event.sessions = std::move(sessions);
++    return event;
 +}
 +
 +static OctetString EncodeHandoverRequiredTransfer()
@@ -264,6 +346,12 @@ index 0000000..69ffc24
 +    if (ue->pduSessions.empty())
 +        m_logger->warn("N2 handover: UE[%d] has no active PDU session, the handover will carry no session resources", ueId);
 +
++    // Correlation id shared by the source/target event logs. It is carried to the target gNB
++    // inside the source-to-target transparent container.
++    uint64_t hoId = (static_cast<uint64_t>(utils::CurrentTimeMillis()) << 20) | (++m_hoIdCounter & 0xFFFFF);
++    ue->hoId = hoId;
++    ue->hoAsSource = true;
++
 +    std::vector<ASN_NGAP_HandoverRequiredIEs *> ies;
 +
 +    // Handover Type
@@ -338,6 +426,7 @@ index 0000000..69ffc24
 +    // Simulation payload: carries the UE radio identity so that the target gNB can match the UE
 +    ho::SourceInfo sourceInfo{};
 +    sourceInfo.ueSti = ue->sti;
++    sourceInfo.hoId = hoId;
 +    asn::SetOctetString(container->rRCContainer, ho::EncodeSourceInfo(sourceInfo));
 +
 +    // Target cell: NR-CGI of the target cell (gNB ID based convention, see NciFromGnbId)
@@ -379,6 +468,9 @@ index 0000000..69ffc24
 +    sendNgapUeAssociated(ueId, pdu);
 +
 +    m_logger->info("N2 handover: Handover Required sent for UE[%d] towards gNB[id %d]", ueId, gnbTargetId);
++
++    ho::EventLog::Instance().emit(
++        MakeEvent(ho::EventRole::Source, ho::EventPhase::HoRequiredSent, hoId, ue, m_base->config->nci, SessionsOf(ue)));
 +}
 +
 +void NgapTask::receiveHandoverRequest(int amfId, uint16_t stream, ASN_NGAP_HandoverRequest *msg)
@@ -395,6 +487,7 @@ index 0000000..69ffc24
 +
 +    // Resolve the simulated UE identity from the source-to-target transparent container
 +    uint64_t ueSti = 0;
++    uint64_t hoId = 0;
 +    auto *ieSourceToTarget =
 +        asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_SourceToTarget_TransparentContainer);
 +    if (ieSourceToTarget != nullptr)
@@ -406,7 +499,10 @@ index 0000000..69ffc24
 +        {
 +            auto info = ho::DecodeSourceInfo(asn::GetOctetString(container->rRCContainer));
 +            if (info.has_value())
++            {
 +                ueSti = info->ueSti;
++                hoId = info->hoId;
++            }
 +            asn::Free(asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer, container);
 +        }
 +    }
@@ -427,8 +523,13 @@ index 0000000..69ffc24
 +    ue->ranUeNgapId = ++m_ueNgapIdCounter;
 +    ue->associatedAmfId = amfId;
 +    ue->sti = ueSti;
++    ue->hoId = hoId;
++    ue->hoAsSource = false;
 +    ue->uplinkStream = stream;
 +    m_ueCtx[provisionalUeId] = ue;
++
++    ho::EventLog::Instance().emit(
++        MakeEvent(ho::EventRole::Target, ho::EventPhase::HoRequestReceived, hoId, ue, m_base->config->nci, {}));
 +
 +    auto *ieAmbr = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UEAggregateMaximumBitRate);
 +    if (ieAmbr != nullptr)
@@ -439,6 +540,7 @@ index 0000000..69ffc24
 +
 +    // PDU session resource allocation
 +    std::vector<PduSessionResource *> sessions;
++    std::vector<int> admittedPsis;
 +    std::vector<ASN_NGAP_PDUSessionResourceAdmittedItem *> admittedList;
 +    std::vector<ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck *> failedList;
 +    int offeredCount = 0;
@@ -522,6 +624,7 @@ index 0000000..69ffc24
 +            asn::SetOctetString(admittedItem->handoverRequestAcknowledgeTransfer, encodedAckTransfer);
 +            admittedList.push_back(admittedItem);
 +            sessions.push_back(resource);
++            admittedPsis.push_back(resource->psi);
 +        }
 +    }
 +
@@ -543,6 +646,8 @@ index 0000000..69ffc24
 +        failureIes.push_back(ieCause);
 +
 +        sendNgapUeAssociated(provisionalUeId, asn::ngap::NewMessagePdu<ASN_NGAP_HandoverFailure>(failureIes));
++        ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Target, ho::EventPhase::HoFailureSent, hoId, ue,
++                                                m_base->config->nci, {}));
 +        deleteUeContext(provisionalUeId);
 +        return;
 +    }
@@ -602,6 +707,7 @@ index 0000000..69ffc24
 +    // Remember the prepared handover until the UE appears on the target cell
 +    auto *pending = new PendingHandover();
 +    pending->sti = ueSti;
++    pending->hoId = hoId;
 +    pending->provisionalUeId = provisionalUeId;
 +    pending->amfCtxId = amfId;
 +    pending->amfUeNgapId = amfUeNgapId;
@@ -616,6 +722,9 @@ index 0000000..69ffc24
 +
 +    sendNgapUeAssociated(provisionalUeId,
 +                         asn::ngap::NewMessagePdu<ASN_NGAP_HandoverRequestAcknowledge>(responseIes));
++
++    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Target, ho::EventPhase::HoAckSent, hoId, ue,
++                                            m_base->config->nci, admittedPsis));
 +}
 +
 +void NgapTask::receiveHandoverCommand(int amfId, ASN_NGAP_HandoverCommand *msg)
@@ -672,9 +781,13 @@ index 0000000..69ffc24
 +    auto w = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::HANDOVER);
 +    w->ueId = ue->ctxId;
 +    w->rrcContainer = std::move(rrcContainer);
++    w->hoId = ue->hoId;
 +    m_base->rrcTask->push(std::move(w));
 +
 +    m_logger->info("N2 handover: Handover Command received, forwarding the handover command to UE[%d]", ue->ctxId);
++
++    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Source, ho::EventPhase::HoCommandReceived, ue->hoId, ue,
++                                            m_base->config->nci, SessionsOf(ue)));
 +}
 +
 +void NgapTask::handleHandoverConfirm(int ueId, uint64_t sti)
@@ -689,6 +802,15 @@ index 0000000..69ffc24
 +    auto *pending = it->second;
 +
 +    m_logger->info("N2 handover: UE[%d] appeared on the target cell (sti[%llu])", ueId, (unsigned long long)sti);
++
++    {
++        auto *provisional = m_ueCtx.count(pending->provisionalUeId) != 0 ? m_ueCtx[pending->provisionalUeId] : nullptr;
++        std::vector<int> pendingSessions;
++        for (auto *session : pending->sessions)
++            pendingSessions.push_back(session->psi);
++        ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Target, ho::EventPhase::RrcRecfgCompleteReceived,
++                                                pending->hoId, provisional, m_base->config->nci, pendingSessions));
++    }
 +
 +    // Release a possibly stale context that occupies the same UE id (e.g. handover back to this node)
 +    if (m_ueCtx.count(ueId) != 0)
@@ -709,6 +831,8 @@ index 0000000..69ffc24
 +    ue->associatedAmfId = pending->amfCtxId;
 +    ue->ueAmbr = pending->ueAmbr;
 +    ue->sti = sti;
++    ue->hoId = pending->hoId;
++    ue->hoAsSource = false;
 +    m_ueCtx[ueId] = ue;
 +
 +    // Materialize the prepared PDU sessions in the GTP layer
@@ -751,6 +875,9 @@ index 0000000..69ffc24
 +    sendNgapUeAssociated(ueId, pdu);
 +
 +    m_logger->info("N2 handover: Handover Notify sent for UE[%d]", ueId);
++
++    ho::EventLog::Instance().emit(
++        MakeEvent(ho::EventRole::Target, ho::EventPhase::HoNotifySent, ue->hoId, ue, m_base->config->nci, SessionsOf(ue)));
 +}
 +
 +void NgapTask::receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg)
@@ -761,6 +888,16 @@ index 0000000..69ffc24
 +                      ngap_utils::CauseToString(ie->Cause).c_str());
 +    else
 +        m_logger->err("N2 handover: handover preparation failure");
++
++    auto idPair = ngap_utils::FindNgapIdPair(msg);
++    NgapUeContext *ue = nullptr;
++    if (idPair.ranUeNgapId.has_value())
++        ue = findUeByRanId(idPair.ranUeNgapId.value());
++    if (ue == nullptr && idPair.amfUeNgapId.has_value())
++        ue = findUeByAmfId(idPair.amfUeNgapId.value());
++
++    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Source, ho::EventPhase::HoPrepFailure,
++                                            ue != nullptr ? ue->hoId : 0, ue, m_base->config->nci, SessionsOf(ue)));
 +}
 +
 +void NgapTask::cancelPendingHandover(uint64_t ueSti, const char *reason)
@@ -878,7 +1015,7 @@ index b0abae9..a942dd5 100644
          break;
      }
 diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
-index 14ea956..5b44769 100644
+index 14ea956..1d5f33a 100644
 --- a/src/gnb/ngap/task.hpp
 +++ b/src/gnb/ngap/task.hpp
 @@ -8,8 +8,10 @@
@@ -903,7 +1040,7 @@ index 14ea956..5b44769 100644
  }
  
  namespace nr::gnb
-@@ -56,6 +62,25 @@ class NgapTask : public NtsTask
+@@ -56,6 +62,27 @@ class NgapTask : public NtsTask
      uint32_t m_downlinkTeidCounter;
      bool m_isInitialized;
  
@@ -912,6 +1049,7 @@ index 14ea956..5b44769 100644
 +    struct PendingHandover
 +    {
 +        uint64_t sti{};
++        uint64_t hoId{};
 +        int provisionalUeId{};
 +        int amfCtxId{};
 +        int64_t amfUeNgapId{};
@@ -923,13 +1061,14 @@ index 14ea956..5b44769 100644
 +
 +    std::unordered_map<uint64_t, PendingHandover *> m_pendingHandovers{};
 +    int m_handoverTempIdCounter{};
++    uint32_t m_hoIdCounter{};
 +
 +    static constexpr int TIMER_ID_HANDOVER_CLEANUP = 101;
 +
      friend class GnbCmdHandler;
  
    public:
-@@ -71,7 +96,7 @@ class NgapTask : public NtsTask
+@@ -71,7 +98,7 @@ class NgapTask : public NtsTask
      /* Utility functions */
      void createAmfContext(const GnbAmfConfig &config);
      NgapAmfContext *findAmfContext(int ctxId);
@@ -938,7 +1077,7 @@ index 14ea956..5b44769 100644
      NgapUeContext *findUeContext(int ctxId);
      NgapUeContext *findUeByRanId(int64_t ranUeNgapId);
      NgapUeContext *findUeByAmfId(int64_t amfUeNgapId);
-@@ -99,7 +124,7 @@ class NgapTask : public NtsTask
+@@ -99,7 +126,7 @@ class NgapTask : public NtsTask
  
      /* NAS transport */
      void handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t rrcEstablishmentCause,
@@ -947,7 +1086,7 @@ index 14ea956..5b44769 100644
      void handleUplinkNasTransport(int ueId, const OctetString &nasPdu);
      void receiveDownlinkNasTransport(int amfId, ASN_NGAP_DownlinkNASTransport *msg);
      void deliverDownlinkNas(int ueId, OctetString &&nasPdu);
-@@ -124,6 +149,16 @@ class NgapTask : public NtsTask
+@@ -124,6 +151,16 @@ class NgapTask : public NtsTask
      /* Radio resource control */
      void handleRadioLinkFailure(int ueId);
      void receivePaging(int amfId, ASN_NGAP_Paging *msg);
@@ -1014,7 +1153,7 @@ index 46c5862..81b11bf 100644
          asn::ngap::FindProtocolIeInPdu(pdu, asn_DEF_ASN_NGAP_UE_NGAP_IDs, ASN_NGAP_ProtocolIE_ID_id_UE_NGAP_IDs);
      if (ptr != nullptr)
 diff --git a/src/gnb/nts.hpp b/src/gnb/nts.hpp
-index ae328ee..4c83087 100644
+index ae328ee..8d3e699 100644
 --- a/src/gnb/nts.hpp
 +++ b/src/gnb/nts.hpp
 @@ -44,6 +44,10 @@ struct NmGnbRlsToRrc : NtsMessage
@@ -1039,7 +1178,7 @@ index ae328ee..4c83087 100644
      // RECEIVE_RLS_MESSAGE
      std::unique_ptr<rls::RlsMessage> msg{};
  
-@@ -166,15 +174,20 @@ struct NmGnbNgapToRrc : NtsMessage
+@@ -166,15 +174,21 @@ struct NmGnbNgapToRrc : NtsMessage
          NAS_DELIVERY,
          AN_RELEASE,
          PAGING,
@@ -1056,11 +1195,12 @@ index ae328ee..4c83087 100644
  
 +    // HANDOVER (simulated handover command payload)
 +    OctetString rrcContainer{};
++    uint64_t hoId{};
 +
      // PAGING
      asn::Unique<ASN_NGAP_FiveG_S_TMSI> uePagingTmsi{};
      asn::Unique<ASN_NGAP_TAIListForPaging> taiListForPaging{};
-@@ -190,12 +203,14 @@ struct NmGnbRrcToNgap : NtsMessage
+@@ -190,12 +204,14 @@ struct NmGnbRrcToNgap : NtsMessage
      {
          INITIAL_NAS_DELIVERY,
          UPLINK_NAS_DELIVERY,
@@ -1076,7 +1216,7 @@ index ae328ee..4c83087 100644
      int ueId{};
  
      // INITIAL_NAS_DELIVERY
-@@ -206,6 +221,10 @@ struct NmGnbRrcToNgap : NtsMessage
+@@ -206,6 +222,10 @@ struct NmGnbRrcToNgap : NtsMessage
      int64_t rrcEstablishmentCause{};
      std::optional<GutiMobileIdentity> sTmsi{};
  
@@ -1202,10 +1342,10 @@ index 0020ac6..9048b46 100644
  }
 diff --git a/src/gnb/rrc/handover.cpp b/src/gnb/rrc/handover.cpp
 new file mode 100644
-index 0000000..215db5c
+index 0000000..765a9a1
 --- /dev/null
 +++ b/src/gnb/rrc/handover.cpp
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,79 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -1223,6 +1363,7 @@ index 0000000..215db5c
 +#include "task.hpp"
 +
 +#include <gnb/ngap/task.hpp>
++#include <lib/ho/events.hpp>
 +#include <lib/rrc/encode.hpp>
 +
 +#include <asn/rrc/ASN_RRC_DL-DCCH-Message.h>
@@ -1232,7 +1373,7 @@ index 0000000..215db5c
 +namespace nr::gnb
 +{
 +
-+void GnbRrcTask::handleHandoverCommand(int ueId, const OctetString &rrcContainer)
++void GnbRrcTask::handleHandoverCommand(int ueId, const OctetString &rrcContainer, uint64_t hoId)
 +{
 +    auto *pdu = asn::New<ASN_RRC_DL_DCCH_Message>();
 +    pdu->message.present = ASN_RRC_DL_DCCH_MessageType_PR_c1;
@@ -1253,6 +1394,18 @@ index 0000000..215db5c
 +
 +    m_logger->info("N2 handover: sending RRC Reconfiguration (handover command) to UE[%d]", ueId);
 +    sendRrcMessage(ueId, pdu);
++
++    {
++        ho::HoEvent event{};
++        event.hoId = hoId;
++        event.role = ho::EventRole::Source;
++        event.phase = ho::EventPhase::RrcRecfgSent;
++        event.nci = m_config->nci;
++        event.ueId = ueId;
++        event.sti = m_ueSti.count(ueId) != 0 ? m_ueSti[ueId] : 0;
++        ho::EventLog::Instance().emit(event);
++    }
++
 +    asn::Free(asn_DEF_ASN_RRC_DL_DCCH_Message, pdu);
 +}
 +
@@ -1293,7 +1446,7 @@ index d6fb019..74c47c6 100644
          break;
      }
 diff --git a/src/gnb/rrc/task.cpp b/src/gnb/rrc/task.cpp
-index 1250cea..37b9b8c 100644
+index 1250cea..00c2961 100644
 --- a/src/gnb/rrc/task.cpp
 +++ b/src/gnb/rrc/task.cpp
 @@ -69,6 +69,10 @@ void GnbRrcTask::onLoop()
@@ -1301,14 +1454,14 @@ index 1250cea..37b9b8c 100644
              handlePaging(w.uePagingTmsi, w.taiListForPaging);
              break;
 +        case NmGnbNgapToRrc::HANDOVER: {
-+            handleHandoverCommand(w.ueId, w.rrcContainer);
++            handleHandoverCommand(w.ueId, w.rrcContainer, w.hoId);
 +            break;
 +        }
          }
          break;
      }
 diff --git a/src/gnb/rrc/task.hpp b/src/gnb/rrc/task.hpp
-index 9da8eb3..ce33c79 100644
+index 9da8eb3..0bfc262 100644
 --- a/src/gnb/rrc/task.hpp
 +++ b/src/gnb/rrc/task.hpp
 @@ -30,6 +30,7 @@ extern "C"
@@ -1334,25 +1487,27 @@ index 9da8eb3..ce33c79 100644
      void receiveUplinkInformationTransfer(int ueId, const ASN_RRC_ULInformationTransfer &msg);
  
 +    /* N2 handover */
-+    void handleHandoverCommand(int ueId, const OctetString &rrcContainer);
++    void handleHandoverCommand(int ueId, const OctetString &rrcContainer, uint64_t hoId);
 +    void receiveRrcHandoverConfirm(int ueId, const ASN_RRC_RRCReconfigurationComplete &msg);
 +
      /* RRC channel send message */
      void sendRrcMessage(ASN_RRC_BCCH_BCH_Message *msg);
      void sendRrcMessage(ASN_RRC_BCCH_DL_SCH_Message *msg);
 diff --git a/src/gnb/types.hpp b/src/gnb/types.hpp
-index 042adb8..6a8eb78 100644
+index 042adb8..2443033 100644
 --- a/src/gnb/types.hpp
 +++ b/src/gnb/types.hpp
-@@ -135,6 +135,7 @@ struct NgapUeContext
+@@ -135,6 +135,9 @@ struct NgapUeContext
      int downlinkStream{};
      AggregateMaximumBitRate ueAmbr{};
      std::set<int> pduSessions{};
-+    uint64_t sti{}; // simulated radio identity (RLS STI) of the UE
++    uint64_t sti{};        // simulated radio identity (RLS STI) of the UE
++    uint64_t hoId{};       // correlation id of the last/ongoing handover (0 if none)
++    bool hoAsSource = true; // role played in that handover (event logging only)
  
      explicit NgapUeContext(int ctxId) : ctxId(ctxId)
      {
-@@ -149,6 +150,7 @@ struct RrcUeContext
+@@ -149,6 +152,7 @@ struct RrcUeContext
      bool isInitialIdSTmsi{}; // TMSI-part-1 or a random value
      int64_t establishmentCause{};
      std::optional<GutiMobileIdentity> sTmsi{};
@@ -1414,12 +1569,293 @@ index fa29239..45aae7d 100644
      explicit GnbCliCommand(PR present) : present(present)
      {
      }
+diff --git a/src/lib/ho/events.cpp b/src/lib/ho/events.cpp
+new file mode 100644
+index 0000000..c3f8a92
+--- /dev/null
++++ b/src/lib/ho/events.cpp
+@@ -0,0 +1,175 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#include "events.hpp"
++
++#include <chrono>
++#include <cstdio>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++
++#include <utils/common.hpp>
++
++namespace fs = std::filesystem;
++
++namespace ho
++{
++
++const char *ToString(EventRole role)
++{
++    switch (role)
++    {
++    case EventRole::Source:
++        return "source";
++    case EventRole::Target:
++        return "target";
++    }
++    return "?";
++}
++
++const char *ToString(EventPhase phase)
++{
++    switch (phase)
++    {
++    case EventPhase::HoRequiredSent:
++        return "HO_REQUIRED_SENT";
++    case EventPhase::HoPrepFailure:
++        return "HO_PREP_FAILURE";
++    case EventPhase::HoCommandReceived:
++        return "HO_COMMAND_RECEIVED";
++    case EventPhase::RrcRecfgSent:
++        return "RRC_RECFG_SENT";
++    case EventPhase::UeCtxReleaseReceived:
++        return "UE_CTX_RELEASE_RECEIVED";
++    case EventPhase::HoRequestReceived:
++        return "HO_REQUEST_RECEIVED";
++    case EventPhase::HoAckSent:
++        return "HO_ACK_SENT";
++    case EventPhase::HoFailureSent:
++        return "HO_FAILURE_SENT";
++    case EventPhase::RrcRecfgCompleteReceived:
++        return "RRC_RECFG_COMPLETE_RECEIVED";
++    case EventPhase::HoNotifySent:
++        return "HO_NOTIFY_SENT";
++    }
++    return "?";
++}
++
++static std::string EscapeJson(const std::string &value)
++{
++    std::string out;
++    out.reserve(value.size() + 2);
++    for (char c : value)
++    {
++        switch (c)
++        {
++        case '"':
++            out += "\\\"";
++            break;
++        case '\\':
++            out += "\\\\";
++            break;
++        case '\n':
++            out += "\\n";
++            break;
++        case '\r':
++            out += "\\r";
++            break;
++        case '\t':
++            out += "\\t";
++            break;
++        default:
++            out += c;
++            break;
++        }
++    }
++    return out;
++}
++
++static int64_t CurrentMonotonicMillis()
++{
++    auto now = std::chrono::steady_clock::now().time_since_epoch();
++    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
++}
++
++std::string SerializeEvent(const HoEvent &event)
++{
++    std::stringstream ss;
++    ss << "{\"schema\":\"ueransim-ho-event/1\""
++       << ",\"ho_id\":" << event.hoId << ",\"wall_ms\":" << event.wallMs << ",\"mono_ms\":" << event.monoMs
++       << ",\"node\":\"" << EscapeJson(event.node) << "\""
++       << ",\"role\":\"" << ToString(event.role) << "\""
++       << ",\"phase\":\"" << ToString(event.phase) << "\""
++       << ",\"ue\":{\"id\":" << event.ueId << ",\"sti\":" << event.sti << ",\"ran_ngap_id\":" << event.ranNgapId
++       << ",\"amf_ue_ngap_id\":" << event.amfUeNgapId << ",\"nci\":" << event.nci << "}"
++       << ",\"sessions\":[";
++    for (size_t i = 0; i < event.sessions.size(); i++)
++    {
++        if (i != 0)
++            ss << ",";
++        ss << event.sessions[i];
++    }
++    ss << "]}";
++    return ss.str();
++}
++
++EventLog &EventLog::Instance()
++{
++    static EventLog instance;
++    return instance;
++}
++
++void EventLog::initialize(const std::string &nodeName)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++
++    m_nodeName = nodeName;
++    m_path = "logs/" + nodeName + ".ho-events.jsonl";
++    m_initialized = true;
++    m_failed = false;
++
++    std::error_code ec;
++    fs::create_directories("logs", ec);
++}
++
++void EventLog::emit(const HoEvent &event)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++
++    if (!m_initialized)
++    {
++        std::fprintf(stderr, "[ho-events] event log is not initialized, event dropped\n");
++        m_failed = true;
++        return;
++    }
++    if (m_failed)
++        return;
++
++    HoEvent e = event;
++    if (e.node.empty())
++        e.node = m_nodeName;
++    if (e.wallMs == 0)
++        e.wallMs = utils::CurrentTimeMillis();
++    if (e.monoMs == 0)
++        e.monoMs = CurrentMonotonicMillis();
++
++    std::ofstream file(m_path, std::ios::app);
++    if (!file.is_open())
++    {
++        std::fprintf(stderr, "[ho-events] cannot open %s, further events are dropped\n", m_path.c_str());
++        m_failed = true;
++        return;
++    }
++
++    file << SerializeEvent(e) << "\n";
++    file.flush();
++}
++
++} // namespace ho
+diff --git a/src/lib/ho/events.hpp b/src/lib/ho/events.hpp
+new file mode 100644
+index 0000000..7a48b2c
+--- /dev/null
++++ b/src/lib/ho/events.hpp
+@@ -0,0 +1,94 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#pragma once
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// Service-agnostic machine-readable handover event log (JSON Lines).
++//
++// Each gNB process appends its handover-related events to
++//   logs/<node-name>.ho-events.jsonl
++// relative to the process working directory. The log is intentionally independent
++// of any upper-layer service (no IMS/SIP/RTP knowledge).
++//
++// Source and target events of the same handover share a hoId: it is generated by
++// the source gNB and carried to the target inside the simulation-defined
++// Source-To-Target transparent container payload (see ho.hpp).
++namespace ho
++{
++
++enum class EventRole
++{
++    Source,
++    Target,
++};
++
++enum class EventPhase
++{
++    HoRequiredSent,
++    HoPrepFailure,
++    HoCommandReceived,
++    RrcRecfgSent,
++    UeCtxReleaseReceived,
++    HoRequestReceived,
++    HoAckSent,
++    HoFailureSent,
++    RrcRecfgCompleteReceived,
++    HoNotifySent,
++};
++
++struct HoEvent
++{
++    uint64_t hoId{};
++    int64_t wallMs{};
++    int64_t monoMs{};
++    std::string node{};
++    EventRole role{};
++    EventPhase phase{};
++    int ueId{};
++    uint64_t sti{};
++    int64_t ranNgapId{};
++    int64_t amfUeNgapId{};
++    int64_t nci{};
++    std::vector<int> sessions{};
++};
++
++const char *ToString(EventRole role);
++const char *ToString(EventPhase phase);
++
++// Serializes one event as a single JSON object (no trailing newline). Pure function.
++std::string SerializeEvent(const HoEvent &event);
++
++class EventLog
++{
++  public:
++    static EventLog &Instance();
++
++    // Sets the node name and opens logs/<nodeName>.ho-events.jsonl in append mode.
++    // Failures are reported once on stderr and never break the caller.
++    void initialize(const std::string &nodeName);
++
++    void emit(const HoEvent &event);
++
++  private:
++    EventLog() = default;
++    EventLog(const EventLog &) = delete;
++    EventLog &operator=(const EventLog &) = delete;
++
++    std::mutex m_mutex;
++    std::string m_nodeName{};
++    std::string m_path{};
++    bool m_initialized{false};
++    bool m_failed{false};
++};
++
++} // namespace ho
 diff --git a/src/lib/ho/ho.cpp b/src/lib/ho/ho.cpp
 new file mode 100644
-index 0000000..8fabeb1
+index 0000000..32aef75
 --- /dev/null
 +++ b/src/lib/ho/ho.cpp
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,79 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -1433,26 +1869,23 @@ index 0000000..8fabeb1
 +namespace ho
 +{
 +
-+static OctetString EncodeU64WithMarker(uint8_t marker, uint64_t value)
-+{
-+    OctetString out;
-+    out.appendOctet(marker);
-+    out.appendOctet8(value);
-+    return out;
-+}
-+
 +OctetString EncodeSourceInfo(const SourceInfo &info)
 +{
-+    return EncodeU64WithMarker(MARKER_SOURCE_INFO, info.ueSti);
++    OctetString out;
++    out.appendOctet(MARKER_SOURCE_INFO);
++    out.appendOctet8(info.ueSti);
++    out.appendOctet8(info.hoId);
++    return out;
 +}
 +
 +std::optional<SourceInfo> DecodeSourceInfo(const OctetString &data)
 +{
-+    if (data.length() != 9 || data.getI(0) != MARKER_SOURCE_INFO)
++    if (data.length() != 17 || data.getI(0) != MARKER_SOURCE_INFO)
 +        return std::nullopt;
 +
 +    SourceInfo info{};
 +    info.ueSti = data.get8UL(1);
++    info.hoId = data.get8UL(9);
 +    return info;
 +}
 +
@@ -1504,10 +1937,10 @@ index 0000000..8fabeb1
 +} // namespace ho
 diff --git a/src/lib/ho/ho.hpp b/src/lib/ho/ho.hpp
 new file mode 100644
-index 0000000..40fda71
+index 0000000..bc9dab7
 --- /dev/null
 +++ b/src/lib/ho/ho.hpp
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,60 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -1539,10 +1972,12 @@ index 0000000..40fda71
 +constexpr uint8_t MARKER_COMMAND_INFO = 0xA2;
 +
 +// Carried in the Source-To-Target Transparent Container (source gNB -> target gNB).
-+// Identifies the simulated UE across gNBs (RLS STI: the stable "over-the-air" identity).
++// Identifies the simulated UE across gNBs (RLS STI: the stable "over-the-air" identity)
++// and carries the handover correlation id (hoId) shared by the source and target event logs.
 +struct SourceInfo
 +{
 +    uint64_t ueSti{};
++    uint64_t hoId{};
 +};
 +
 +// Carried in the Target-To-Source Transparent Container (target gNB -> source gNB) and then
@@ -1969,10 +2404,10 @@ index 33f91a7..9f54535 100644
  } // namespace nr::ue
 diff --git a/tests/handover/CMakeLists.txt b/tests/handover/CMakeLists.txt
 new file mode 100644
-index 0000000..0ae7df6
+index 0000000..da0025e
 --- /dev/null
 +++ b/tests/handover/CMakeLists.txt
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +# N2 handover unit tests (self-contained, no external test framework).
 +#
 +# The test lives in its own subdirectory so that this delivery can coexist with other test
@@ -1981,6 +2416,7 @@ index 0000000..0ae7df6
 +add_executable(ho-tests
 +  ho_tests.cpp
 +  ../../src/lib/ho/ho.cpp
++  ../../src/lib/ho/events.cpp
 +  ../../src/utils/octet_string.cpp
 +  ../../src/utils/common.cpp
 +)
@@ -1991,10 +2427,10 @@ index 0000000..0ae7df6
 +add_test(NAME ho-tests COMMAND ho-tests)
 diff --git a/tests/handover/ho_tests.cpp b/tests/handover/ho_tests.cpp
 new file mode 100644
-index 0000000..638a731
+index 0000000..087c96e
 --- /dev/null
 +++ b/tests/handover/ho_tests.cpp
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,140 @@
 +// Plain-assert unit tests for the N2 handover pure functions.
 +//
 +// Covers the simulation container codec (lib/ho) and the deterministic cell ranking used by
@@ -2002,9 +2438,11 @@ index 0000000..638a731
 +
 +#include <cstdint>
 +#include <cstdio>
++#include <string>
 +#include <utility>
 +#include <vector>
 +
++#include <lib/ho/events.hpp>
 +#include <lib/ho/ho.hpp>
 +
 +static int g_failures = 0;
@@ -2031,15 +2469,18 @@ index 0000000..638a731
 +    {
 +        SourceInfo info{};
 +        info.ueSti = 0x1122334455667788ULL;
++        info.hoId = 0xAABBCCDD00112233ULL;
 +        auto encoded = EncodeSourceInfo(info);
-+        CHECK(encoded.length() == 9, "source info encoded length is 9");
++        CHECK(encoded.length() == 17, "source info encoded length is 17");
 +
 +        auto decoded = DecodeSourceInfo(encoded);
-+        CHECK(decoded.has_value() && decoded->ueSti == info.ueSti, "source info round trip");
++        CHECK(decoded.has_value() && decoded->ueSti == info.ueSti && decoded->hoId == info.hoId,
++              "source info round trip (sti + ho id)");
 +    }
 +    {
 +        OctetString wrongMarker;
 +        wrongMarker.appendOctet(MARKER_COMMAND_INFO);
++        wrongMarker.appendOctet8(uint64_t{1});
 +        wrongMarker.appendOctet8(uint64_t{1});
 +        CHECK(!DecodeSourceInfo(wrongMarker).has_value(), "source info rejects wrong marker");
 +
@@ -2094,6 +2535,31 @@ index 0000000..638a731
 +        auto found = FindCellByNci(cells, 0x20);
 +        CHECK(found.has_value() && found.value() == 2, "target cell resolved by NCI");
 +        CHECK(!FindCellByNci(cells, 0x40).has_value(), "unknown NCI is not resolved");
++    }
++
++    // ---------- Event serialization ----------
++    {
++        HoEvent e{};
++        e.hoId = 42;
++        e.wallMs = 1000;
++        e.monoMs = 123;
++        e.node = "gnb\"x";
++        e.role = EventRole::Source;
++        e.phase = EventPhase::HoRequiredSent;
++        e.ueId = 1;
++        e.sti = 7;
++        e.ranNgapId = 2;
++        e.amfUeNgapId = 3;
++        e.nci = 0x10;
++        e.sessions = {1, 2};
++
++        auto s = SerializeEvent(e);
++        CHECK(s.find("\"schema\":\"ueransim-ho-event/1\"") != std::string::npos, "event schema serialized");
++        CHECK(s.find("\"ho_id\":42") != std::string::npos, "event ho id serialized");
++        CHECK(s.find("\"phase\":\"HO_REQUIRED_SENT\"") != std::string::npos, "event phase serialized");
++        CHECK(s.find("\"role\":\"source\"") != std::string::npos, "event role serialized");
++        CHECK(s.find("\"sessions\":[1,2]") != std::string::npos, "event sessions serialized");
++        CHECK(s.find("gnb\\\"x") != std::string::npos, "event node name escaped");
 +    }
 +
 +    if (g_failures == 0)
