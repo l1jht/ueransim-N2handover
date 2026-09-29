@@ -15,7 +15,8 @@
 - **仿真身份设计**：以 RLS **STI**（UE 的"空口"稳定标识）跨 gNB 标识 UE，以 **NCI** 让 UE 定位目标小区——不依赖节点顺序/ID 巧合（修复了社区 PR 方案中的脆弱假设）
 - **确定性小区选择**：同信号强度时按较小 NCI 择先，保证初始驻留与切换演示可复现
 - **基础数据面**：UL 在 UE 迁移后立即经目标 gNB（NL 转 N3）；DL 在 5GC 路径切换后恢复。**不实现** gNB 间转发隧道（见"简化点"）
-- **单元测试**：`ctest` 覆盖透明容器编解码（边界/非法输入）、确定性小区排序、目标小区解析
+- **结构化事件日志**：每个 gNB 写 `logs/<gnb-name>.ho-events.jsonl`（JSONL；`ho_id` 贯通源/目标、阶段枚举、单调/挂钟时间戳），零新增配置项、服务无关；配套 `deploy/ho-batch.sh` 批量往返驱动
+- **单元测试**：`ctest` 覆盖透明容器编解码（边界/非法输入）、确定性小区排序、目标小区解析、事件序列化
 - **与 ueransim-ims 补丁共存**：两种 apply 顺序均可干净应用，编译通过，双测试套件（`ims-tests` + `ho-tests`）全绿
 
 ## 与 3GPP 流程的对应
@@ -57,13 +58,15 @@ ueransim-N2handover/
 │   ├── gnb2.yaml                目标 gNB 配置模板
 │   └── ue.yaml                  UE 配置模板（gnbSearchList 含两个 gNB）
 ├── deploy/
-│   ├── docker-compose.n2handover.yaml   free5GC compose 的 gNB/UE override
+│   ├── docker-compose.n2handover.yaml   free5GC compose 的 gNB/UE override（含事件目录挂载）
 │   ├── provision-subscriber.sh          通过 WebUI API 开通订阅者
-│   └── run-handover.sh                  触发切换并打印两侧结果
+│   ├── run-handover.sh                  触发切换并打印两侧结果
+│   └── ho-batch.sh                      批量切换驱动（N 次 / 往返 / 参数化）
 └── docs/
     ├── ARCHITECTURE.md          实现架构、仿真身份设计、与规范的对应与简化点
     ├── BUILD.md                 构建（含与 ueransim-ims 补丁共存的验证）
     ├── RUN.md                   端到端运行（free5GC/Open5GS）、触发切换、验证与排错
+    ├── MEASUREMENT.md           事件日志 schema、批量驱动、IMS 连续性取证方法
     └── REGRESSION.md            本地回归测试记录（含基线对照实验）
 ```
 
@@ -93,6 +96,7 @@ ctest --output-on-failure
 | 单元测试（`ho-tests`） | ✅ 14 项通过 |
 | 端到端（free5GC v4.2.3 compose，双 gNB + UE，**交付包文件原样**） | ✅ 已验证：多次切换（含反向），单次全过程约 27 ms；切换前后 ping 0% 丢包；`tcpdump` 证实切换后 GTP 仅经目标 gNB。详见 `docs/RUN.md` §9 |
 | **本地回归测试**（多 UE、多 PDU 会话、失败路径、基线对照） | ✅ 全部通过，未引入回归；详见 `docs/REGRESSION.md` |
+| 结构化事件日志 + 批量驱动 | ✅ free5GC 实测（3 次往返切换，`ho_id` 两侧一致、宿主机可见 JSONL）；详见 `docs/MEASUREMENT.md` |
 
 ## 简化点（重要）
 

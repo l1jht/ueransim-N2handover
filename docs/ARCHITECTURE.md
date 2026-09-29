@@ -6,11 +6,12 @@
 
 ## 1. 代码结构与职责
 
-补丁共触及 36 个文件（29 改 + 7 新增）。新增文件：
+补丁共触及 40 个文件（31 改 + 9 新增）。新增文件：
 
 | 文件 | 职责 |
 |---|---|
 | `src/lib/ho/ho.hpp/.cpp` | **共享纯函数库**：仿真透明容器编解码（`SourceInfo`/`CommandInfo`）、确定性小区排序（`IsBetterCell`）、按 NCI 解析小区（`FindCellByNci`）。无任务依赖，可单元测试 |
+| `src/lib/ho/events.hpp/.cpp` | **切换事件日志**：服务无关的 JSONL 事件写入器（`ho_id` 关联源/目标、单调/挂钟时间戳、失败不影响切换流程）。无任务依赖，可单元测试 |
 | `src/gnb/ngap/handover.cpp` | gNB 侧 NGAP 切换过程：`sendHandoverRequired`（源）、`receiveHandoverRequest`（目标，资源分配+回 Ack/Failure）、`receiveHandoverCommand`（源）、`handleHandoverConfirm`、`sendHandoverNotify`、失败/超时清理 |
 | `src/gnb/rrc/handover.cpp` | gNB RRC：把切换命令封装为 RRC Reconfiguration 下发；接收 RRC Reconfiguration Complete 并通知 NGAP |
 | `src/ue/rrc/handover.cpp` | UE RRC：解析切换命令、按 NCI 解析目标小区、切换服务小区（`ASSIGN_CURRENT_CELL`）、发送 RRC Reconfiguration Complete、通知 NAS |
@@ -78,7 +79,7 @@
 
 | 载荷 | 字节布局 | 说明 |
 |---|---|---|
-| `SourceInfo`（源→目标） | `0xA1 + 8 字节大端 ueSti` | 跨 gNB 的 UE 标识 |
+| `SourceInfo`（源→目标） | `0xA1 + 8 字节大端 ueSti + 8 字节大端 ho_id`（共 17 字节） | 跨 gNB 的 UE 标识 + 切换关联 ID（源侧生成，供两侧事件日志配对） |
 | `CommandInfo`（目标→源→UE） | `0xA2 + 5 字节大端 NCI（36bit，高 4 位须为 0）` | 目标小区定位 |
 
 `ho::Decode*` 对标记、长度、NCI 位宽做严格校验，非法输入返回空。
@@ -86,6 +87,8 @@
 ### 3.4 目标小区 NCI 的推导（源侧视图）
 
 真实网络中源 gNB 通过 ANR/OAM 获知邻区 CGI。仿真中约定 **NCI = gNB ID（idLength 位）+ 小区部分（0）**，即 `nci = gnbId << (36 - idLength)`（与 UERANSIM 配置约定、NG Setup 中的 GlobalGNB-ID 编码一致）。`handover` CLI 只给出目标 gNB ID，源侧据此推导 TargetID 与透明容器中的 CGI。**配置模板遵循该约定**（gnb1: `nci=0x000000010` → gNB ID 1；gnb2: `nci=0x000000020` → gNB ID 2）。
+
+> **扩展点（已评估、暂缓）**：当需要"不同配置的邻区"（跨 TAC/PLMN、非约定 NCI）时，可将上述约定替换为 gNB YAML 的 `neighbors:` 邻区表（gNB ID / PLMN / TAC / NCI）。改动集中在源侧触发时的一次目标解析（约 0.5–1 人天、向后兼容、无 UE/目标侧联动）；当前按范围决定维持约定模型，待实验出现该需求时实施。
 
 ---
 
@@ -128,6 +131,7 @@
 | 7 | 目标小区 NCI 由 gNB ID 约定推导（见 §3.4） | 仿真中替代 ANR/OAM |
 | 8 | 假定两 gNB 同 PLMN/TAC（TargetID 的 selectedTAI 用源侧配置） | 基础场景；跨 PLMN/TAC 需扩展 |
 | 9 | 每次 Handover Required 携带"全部 PDU 会话" | 与规范一致；但 QoS 流级失败处理从简（会话级） |
+| 10 | gNB 间数据转发未实现（**v2 扩展点**：源侧 GTP 重定向 + 目标侧转发隧道接入，属中等改动） | 属"缩短中断"类优化研究，当前场景为**测量**性质（DL 中断窗口即测量对象） |
 
 ## 7. 与 ueransim-ims 补丁的共存设计
 
