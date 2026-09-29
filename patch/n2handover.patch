@@ -1,0 +1,2107 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 08ec1fd..5a73ffb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,3 +51,10 @@ target_link_libraries(nr-cli pthread)
+ target_compile_options(nr-cli PRIVATE -Wall -Wextra -pedantic)
+ 
+ target_link_libraries(nr-cli common-lib)
++
++#################### N2 HANDOVER TESTS ####################
++# Kept in a dedicated subdirectory so that this delivery can coexist with other test suites
++# (e.g. the IMS delivery) that also extend the tests/ directory.
++
++enable_testing()
++add_subdirectory(tests/handover)
+diff --git a/src/gnb/app/cmd_handler.cpp b/src/gnb/app/cmd_handler.cpp
+index 656bbc6..a2f6135 100644
+--- a/src/gnb/app/cmd_handler.cpp
++++ b/src/gnb/app/cmd_handler.cpp
+@@ -154,6 +154,17 @@ void GnbCmdHandler::handleCmdImpl(NmGnbCliCommand &msg)
+         }
+         break;
+     }
++    case app::GnbCliCommand::HANDOVER: {
++        if (m_base->ngapTask->m_ueCtx.count(msg.cmd->ueId) == 0)
++            sendError(msg.address, "UE not found with given ID");
++        else
++        {
++            m_base->ngapTask->sendHandoverRequired(msg.cmd->ueId, msg.cmd->gnbId);
++            sendResult(msg.address, "Requesting N2 handover for UE[" + std::to_string(msg.cmd->ueId) +
++                                        "] towards gNB[" + std::to_string(msg.cmd->gnbId) + "]");
++        }
++        break;
++    }
+     }
+ }
+ 
+diff --git a/src/gnb/gtp/task.cpp b/src/gnb/gtp/task.cpp
+index 0475dcb..47b02d9 100644
+--- a/src/gnb/gtp/task.cpp
++++ b/src/gnb/gtp/task.cpp
+@@ -113,12 +113,34 @@ void GtpTask::handleSessionCreate(PduSessionResource *session)
+     if (!m_ueContexts.count(session->ueId))
+     {
+         m_logger->err("PDU session resource could not be created, UE context with ID[%d] not found", session->ueId);
++        delete session;
+         return;
+     }
+ 
+     uint64_t sessionInd = MakeSessionResInd(session->ueId, session->psi);
+-    m_pduSessions[sessionInd] = std::unique_ptr<PduSessionResource>(session);
+ 
++    // The session may already exist, for example when the UE hands over back to a gNB that has not
++    // released the sessions of a previous handover yet. In that case the downlink tunnel endpoint
++    // is replaced with the newly allocated one.
++    auto it = m_pduSessions.find(sessionInd);
++    if (it != m_pduSessions.end())
++    {
++        uint32_t oldTeid = it->second->downTunnel.teid;
++        uint32_t newTeid = session->downTunnel.teid;
++
++        m_sessionTree.remove(sessionInd, oldTeid);
++        it->second = std::unique_ptr<PduSessionResource>(session);
++        m_sessionTree.insert(sessionInd, newTeid);
++
++        m_logger->warn("PDU session resource already exists for UE[%d] PSI[%d], DL TEID replaced %u -> %u",
++                       session->ueId, session->psi, oldTeid, newTeid);
++
++        updateAmbrForUe(session->ueId);
++        updateAmbrForSession(sessionInd);
++        return;
++    }
++
++    m_pduSessions[sessionInd] = std::unique_ptr<PduSessionResource>(session);
+     m_sessionTree.insert(sessionInd, session->downTunnel.teid);
+ 
+     updateAmbrForUe(session->ueId);
+diff --git a/src/gnb/ngap/handover.cpp b/src/gnb/ngap/handover.cpp
+new file mode 100644
+index 0000000..69ffc24
+--- /dev/null
++++ b/src/gnb/ngap/handover.cpp
+@@ -0,0 +1,714 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++// N2 based inter NG-RAN handover (simulation).
++//
++// Source side (see sendHandoverRequired / receiveHandoverCommand):
++//   NGAP Handover Required -> AMF -> ... -> NGAP Handover Command -> RRC Reconfiguration to the UE.
++// Target side (see receiveHandoverRequest / handleHandoverConfirm):
++//   NGAP Handover Request -> resource allocation -> Handover Request Acknowledge ->
++//   (UE appears on the target cell) -> Handover Notify.
++//
++// The radio interface of UERANSIM is simulated, therefore the transparent containers exchanged
++// over NGAP are filled with the simulation-defined payloads from lib/ho. See docs for details.
++
++#include "encode.hpp"
++#include "task.hpp"
++#include "utils.hpp"
++
++#include <stdexcept>
++#include <vector>
++
++#include <gnb/gtp/task.hpp>
++#include <gnb/nts.hpp>
++#include <gnb/rrc/task.hpp>
++#include <lib/ho/ho.hpp>
++#include <utils/common.hpp>
++
++#include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
++#include <asn/ngap/ASN_NGAP_GTPTunnel.h>
++#include <asn/ngap/ASN_NGAP_GlobalGNB-ID.h>
++#include <asn/ngap/ASN_NGAP_HandoverCommand.h>
++#include <asn/ngap/ASN_NGAP_HandoverFailure.h>
++#include <asn/ngap/ASN_NGAP_HandoverNotify.h>
++#include <asn/ngap/ASN_NGAP_HandoverPreparationFailure.h>
++#include <asn/ngap/ASN_NGAP_HandoverRequest.h>
++#include <asn/ngap/ASN_NGAP_HandoverRequestAcknowledge.h>
++#include <asn/ngap/ASN_NGAP_HandoverRequestAcknowledgeTransfer.h>
++#include <asn/ngap/ASN_NGAP_HandoverRequired.h>
++#include <asn/ngap/ASN_NGAP_HandoverRequiredTransfer.h>
++#include <asn/ngap/ASN_NGAP_HandoverResourceAllocationUnsuccessfulTransfer.h>
++#include <asn/ngap/ASN_NGAP_LastVisitedCellInformation.h>
++#include <asn/ngap/ASN_NGAP_LastVisitedCellItem.h>
++#include <asn/ngap/ASN_NGAP_LastVisitedNGRANCellInformation.h>
++#include <asn/ngap/ASN_NGAP_NGRAN-CGI.h>
++#include <asn/ngap/ASN_NGAP_NR-CGI.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceAdmittedItem.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceItemHORqd.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceSetupItemHOReq.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceSetupRequestTransfer.h>
++#include <asn/ngap/ASN_NGAP_ProtocolIE-Field.h>
++#include <asn/ngap/ASN_NGAP_QosFlowItemWithDataForwarding.h>
++#include <asn/ngap/ASN_NGAP_QosFlowSetupRequestItem.h>
++#include <asn/ngap/ASN_NGAP_SourceNGRANNode-ToTargetNGRANNode-TransparentContainer.h>
++#include <asn/ngap/ASN_NGAP_TargetNGRANNode-ToSourceNGRANNode-TransparentContainer.h>
++#include <asn/ngap/ASN_NGAP_TargetRANNodeID.h>
++#include <asn/ngap/ASN_NGAP_UPTransportLayerInformation.h>
++#include <asn/ngap/ASN_NGAP_UEAggregateMaximumBitRate.h>
++
++namespace nr::gnb
++{
++
++// The target NCI is derived from the target gNB ID using the same convention as the NG Setup
++// (36-bit NCI = gNB ID (idLength bits) followed by the cell ID part, which is 0 in this simulation).
++static uint64_t NciFromGnbId(uint32_t gnbId, int idLength)
++{
++    if (idLength < 22 || idLength > 32)
++        return 0;
++    return static_cast<uint64_t>(gnbId) << (36 - idLength);
++}
++
++static OctetString EncodeHandoverRequiredTransfer()
++{
++    auto *transfer = asn::New<ASN_NGAP_HandoverRequiredTransfer>();
++    // directForwardingPathAvailability is intentionally absent: gNB-to-gNB data forwarding is not
++    // implemented in this simulation (see the user plane notes in the delivery documentation).
++    OctetString encoded = ngap_encode::EncodeS(asn_DEF_ASN_NGAP_HandoverRequiredTransfer, transfer);
++    asn::Free(asn_DEF_ASN_NGAP_HandoverRequiredTransfer, transfer);
++    return encoded;
++}
++
++static void FillPduSessionResourceFromTransfer(ASN_NGAP_PDUSessionResourceSetupRequestTransfer *transfer,
++                                               PduSessionResource *resource)
++{
++    auto *ie = asn::ngap::GetProtocolIe(transfer, ASN_NGAP_ProtocolIE_ID_id_PDUSessionAggregateMaximumBitRate);
++    if (ie != nullptr)
++    {
++        resource->sessionAmbr.dlAmbr =
++            asn::GetUnsigned64(ie->PDUSessionAggregateMaximumBitRate.pDUSessionAggregateMaximumBitRateDL) / 8ull;
++        resource->sessionAmbr.ulAmbr =
++            asn::GetUnsigned64(ie->PDUSessionAggregateMaximumBitRate.pDUSessionAggregateMaximumBitRateUL) / 8ull;
++    }
++
++    ie = asn::ngap::GetProtocolIe(transfer, ASN_NGAP_ProtocolIE_ID_id_DataForwardingNotPossible);
++    if (ie != nullptr)
++        resource->dataForwardingNotPossible = true;
++
++    ie = asn::ngap::GetProtocolIe(transfer, ASN_NGAP_ProtocolIE_ID_id_PDUSessionType);
++    if (ie != nullptr)
++        resource->sessionType = ngap_utils::PduSessionTypeFromAsn(ie->PDUSessionType);
++
++    ie = asn::ngap::GetProtocolIe(transfer, ASN_NGAP_ProtocolIE_ID_id_UL_NGU_UP_TNLInformation);
++    if (ie != nullptr)
++    {
++        resource->upTunnel.teid = (uint32_t)asn::GetOctet4(ie->UPTransportLayerInformation.choice.gTPTunnel->gTP_TEID);
++        resource->upTunnel.address = asn::GetOctetString(ie->UPTransportLayerInformation.choice.gTPTunnel->transportLayerAddress);
++    }
++
++    ie = asn::ngap::GetProtocolIe(transfer, ASN_NGAP_ProtocolIE_ID_id_QosFlowSetupRequestList);
++    if (ie != nullptr)
++    {
++        auto *ptr = asn::New<ASN_NGAP_QosFlowSetupRequestList>();
++        asn::DeepCopy(asn_DEF_ASN_NGAP_QosFlowSetupRequestList, ie->QosFlowSetupRequestList, ptr);
++        resource->qosFlows = asn::WrapUnique(ptr, asn_DEF_ASN_NGAP_QosFlowSetupRequestList);
++    }
++}
++
++static std::optional<NgapCause> ValidateSessionResource(const PduSessionResource *resource)
++{
++    if (resource->sessionType != PduSessionType::IPv4)
++        return NgapCause::RadioNetwork_unspecified;
++
++    if (resource->upTunnel.address.length() == 0)
++        return NgapCause::Protocol_transfer_syntax_error;
++
++    if (resource->qosFlows == nullptr || resource->qosFlows->list.count == 0)
++        return NgapCause::Protocol_semantic_error;
++
++    return std::nullopt;
++}
++
++static ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck *CreateUnsuccessfulSessionItem(int psi, NgapCause cause,
++                                                                                        Logger &logger)
++{
++    auto *tr = asn::New<ASN_NGAP_HandoverResourceAllocationUnsuccessfulTransfer>();
++    ngap_utils::ToCauseAsn_Ref(cause, tr->cause);
++
++    OctetString encodedTr =
++        ngap_encode::EncodeS(asn_DEF_ASN_NGAP_HandoverResourceAllocationUnsuccessfulTransfer, tr);
++    if (encodedTr.length() == 0)
++    {
++        asn::Free(asn_DEF_ASN_NGAP_HandoverResourceAllocationUnsuccessfulTransfer, tr);
++        logger.err("HandoverResourceAllocationUnsuccessfulTransfer encoding failed");
++        return nullptr;
++    }
++    asn::Free(asn_DEF_ASN_NGAP_HandoverResourceAllocationUnsuccessfulTransfer, tr);
++
++    auto *item = asn::New<ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck>();
++    item->pDUSessionID = static_cast<ASN_NGAP_PDUSessionID_t>(psi);
++    asn::SetOctetString(item->handoverResourceAllocationUnsuccessfulTransfer, encodedTr);
++    return item;
++}
++
++void NgapTask::sendHandoverRequired(int ueId, int gnbTargetId)
++{
++    auto *ue = findUeContext(ueId);
++    if (ue == nullptr)
++        return;
++
++    if (ue->sti == 0)
++    {
++        m_logger->err("N2 handover: UE[%d] has no simulated radio identity yet, cannot start a handover", ueId);
++        return;
++    }
++
++    auto *amf = findAmfContext(ue->associatedAmfId);
++    if (amf == nullptr)
++        return;
++
++    if (amf->state != EAmfState::CONNECTED)
++    {
++        m_logger->err("N2 handover: cannot start a handover, the AMF is not in connected state");
++        return;
++    }
++
++    if (ue->pduSessions.empty())
++        m_logger->warn("N2 handover: UE[%d] has no active PDU session, the handover will carry no session resources", ueId);
++
++    std::vector<ASN_NGAP_HandoverRequiredIEs *> ies;
++
++    // Handover Type
++    auto *ieHandoverType = asn::New<ASN_NGAP_HandoverRequiredIEs>();
++    ieHandoverType->id = ASN_NGAP_ProtocolIE_ID_id_HandoverType;
++    ieHandoverType->criticality = ASN_NGAP_Criticality_reject;
++    ieHandoverType->value.present = ASN_NGAP_HandoverRequiredIEs__value_PR_HandoverType;
++    ieHandoverType->value.choice.HandoverType = ASN_NGAP_HandoverType_intra5gs;
++    ies.push_back(ieHandoverType);
++
++    // Cause
++    auto *ieCause = asn::New<ASN_NGAP_HandoverRequiredIEs>();
++    ieCause->id = ASN_NGAP_ProtocolIE_ID_id_Cause;
++    ieCause->criticality = ASN_NGAP_Criticality_ignore;
++    ieCause->value.present = ASN_NGAP_HandoverRequiredIEs__value_PR_Cause;
++    ngap_utils::ToCauseAsn_Ref(NgapCause::RadioNetwork_handover_desirable_for_radio_reason, ieCause->value.choice.Cause);
++    ies.push_back(ieCause);
++
++    // Target ID: the target RAN node is identified by its global gNB ID and the selected TAI.
++    // The simulation assumes that both gNBs serve the same PLMN and TAC.
++    auto *ieTargetId = asn::New<ASN_NGAP_HandoverRequiredIEs>();
++    ieTargetId->id = ASN_NGAP_ProtocolIE_ID_id_TargetID;
++    ieTargetId->criticality = ASN_NGAP_Criticality_reject;
++    ieTargetId->value.present = ASN_NGAP_HandoverRequiredIEs__value_PR_TargetID;
++    ieTargetId->value.choice.TargetID.present = ASN_NGAP_TargetID_PR_targetRANNodeID;
++
++    auto *targetRanNodeId = asn::New<ASN_NGAP_TargetRANNodeID>();
++    targetRanNodeId->globalRANNodeID.present = ASN_NGAP_GlobalRANNodeID_PR_globalGNB_ID;
++
++    auto *globalGnbId = asn::New<ASN_NGAP_GlobalGNB_ID>();
++    globalGnbId->gNB_ID.present = ASN_NGAP_GNB_ID_PR_gNB_ID;
++    auto gnbIdLength = m_base->config->gnbIdLength;
++    auto bitsToShift = 32 - gnbIdLength;
++    asn::SetBitString(globalGnbId->gNB_ID.choice.gNB_ID,
++                      octet4{static_cast<uint32_t>(gnbTargetId) << bitsToShift}, static_cast<size_t>(gnbIdLength));
++    asn::SetOctetString3(globalGnbId->pLMNIdentity, ngap_utils::PlmnToOctet3(m_base->config->plmn));
++    targetRanNodeId->globalRANNodeID.choice.globalGNB_ID = globalGnbId;
++
++    asn::SetOctetString3(targetRanNodeId->selectedTAI.pLMNIdentity, ngap_utils::PlmnToOctet3(m_base->config->plmn));
++    asn::SetOctetString3(targetRanNodeId->selectedTAI.tAC, octet3{m_base->config->tac});
++    ieTargetId->value.choice.TargetID.choice.targetRANNodeID = targetRanNodeId;
++    ies.push_back(ieTargetId);
++
++    // PDU Session Resource List.
++    // "All PDU sessions handled by S-RAN (i.e. all existing PDU sessions with active UP
++    // connections) shall be included" - TS 23.502 4.9.1.3.2 step 1.
++    if (!ue->pduSessions.empty())
++    {
++        auto *ieSessionList = asn::New<ASN_NGAP_HandoverRequiredIEs>();
++        ieSessionList->id = ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceListHORqd;
++        ieSessionList->criticality = ASN_NGAP_Criticality_reject;
++        ieSessionList->value.present = ASN_NGAP_HandoverRequiredIEs__value_PR_PDUSessionResourceListHORqd;
++
++        for (int psi : ue->pduSessions)
++        {
++            auto *sessionItem = asn::New<ASN_NGAP_PDUSessionResourceItemHORqd>();
++            sessionItem->pDUSessionID = static_cast<ASN_NGAP_PDUSessionID_t>(psi);
++            asn::SetOctetString(sessionItem->handoverRequiredTransfer, EncodeHandoverRequiredTransfer());
++            asn::SequenceAdd(ieSessionList->value.choice.PDUSessionResourceListHORqd, sessionItem);
++        }
++        ies.push_back(ieSessionList);
++    }
++
++    // Source To Target Transparent Container
++    auto *ieSourceToTarget = asn::New<ASN_NGAP_HandoverRequiredIEs>();
++    ieSourceToTarget->id = ASN_NGAP_ProtocolIE_ID_id_SourceToTarget_TransparentContainer;
++    ieSourceToTarget->criticality = ASN_NGAP_Criticality_reject;
++    ieSourceToTarget->value.present = ASN_NGAP_HandoverRequiredIEs__value_PR_SourceToTarget_TransparentContainer;
++
++    auto *container = asn::New<ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer>();
++
++    // Simulation payload: carries the UE radio identity so that the target gNB can match the UE
++    ho::SourceInfo sourceInfo{};
++    sourceInfo.ueSti = ue->sti;
++    asn::SetOctetString(container->rRCContainer, ho::EncodeSourceInfo(sourceInfo));
++
++    // Target cell: NR-CGI of the target cell (gNB ID based convention, see NciFromGnbId)
++    container->targetCell_ID.present = ASN_NGAP_NGRAN_CGI_PR_nR_CGI;
++    container->targetCell_ID.choice.nR_CGI = asn::New<ASN_NGAP_NR_CGI>();
++    asn::SetOctetString3(container->targetCell_ID.choice.nR_CGI->pLMNIdentity,
++                         ngap_utils::PlmnToOctet3(m_base->config->plmn));
++    asn::SetBitStringLong<36>(NciFromGnbId(static_cast<uint32_t>(gnbTargetId), gnbIdLength),
++                              container->targetCell_ID.choice.nR_CGI->nRCellIdentity);
++
++    // UE history information: the currently serving cell of this gNB
++    auto *historyItem = asn::New<ASN_NGAP_LastVisitedCellItem>();
++    historyItem->lastVisitedCellInformation.present = ASN_NGAP_LastVisitedCellInformation_PR_nGRANCell;
++    historyItem->lastVisitedCellInformation.choice.nGRANCell =
++        asn::New<ASN_NGAP_LastVisitedNGRANCellInformation>();
++
++    auto *historyNrCgi = asn::New<ASN_NGAP_NR_CGI>();
++    asn::SetOctetString3(historyNrCgi->pLMNIdentity, ngap_utils::PlmnToOctet3(m_base->config->plmn));
++    asn::SetBitStringLong<36>(m_base->config->nci, historyNrCgi->nRCellIdentity);
++    historyItem->lastVisitedCellInformation.choice.nGRANCell->globalCellID.present = ASN_NGAP_NGRAN_CGI_PR_nR_CGI;
++    historyItem->lastVisitedCellInformation.choice.nGRANCell->globalCellID.choice.nR_CGI = historyNrCgi;
++    historyItem->lastVisitedCellInformation.choice.nGRANCell->cellType.cellSize = ASN_NGAP_CellSize_medium;
++    historyItem->lastVisitedCellInformation.choice.nGRANCell->timeUEStayedInCell = 42;
++    ASN_SEQUENCE_ADD(&container->uEHistoryInformation.list, historyItem);
++
++    OctetString encodedContainer = ngap_encode::EncodeS(
++        asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer, container);
++    if (encodedContainer.length() == 0)
++    {
++        asn::Free(asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer, container);
++        m_logger->err("N2 handover: source-to-target transparent container encoding failed");
++        return;
++    }
++    asn::Free(asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer, container);
++    asn::SetOctetString(ieSourceToTarget->value.choice.SourceToTarget_TransparentContainer, encodedContainer);
++    ies.push_back(ieSourceToTarget);
++
++    auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_HandoverRequired>(ies);
++    sendNgapUeAssociated(ueId, pdu);
++
++    m_logger->info("N2 handover: Handover Required sent for UE[%d] towards gNB[id %d]", ueId, gnbTargetId);
++}
++
++void NgapTask::receiveHandoverRequest(int amfId, uint16_t stream, ASN_NGAP_HandoverRequest *msg)
++{
++    m_logger->debug("N2 handover: Handover Request received from AMF[%d]", amfId);
++
++    auto *ieAmfNgapId = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_AMF_UE_NGAP_ID);
++    if (ieAmfNgapId == nullptr)
++    {
++        m_logger->err("N2 handover: Handover Request without AMF-UE-NGAP-ID, ignoring");
++        return;
++    }
++    auto amfUeNgapId = asn::GetSigned64(ieAmfNgapId->AMF_UE_NGAP_ID);
++
++    // Resolve the simulated UE identity from the source-to-target transparent container
++    uint64_t ueSti = 0;
++    auto *ieSourceToTarget =
++        asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_SourceToTarget_TransparentContainer);
++    if (ieSourceToTarget != nullptr)
++    {
++        auto *container = ngap_encode::Decode<ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer>(
++            asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer,
++            ieSourceToTarget->SourceToTarget_TransparentContainer);
++        if (container != nullptr)
++        {
++            auto info = ho::DecodeSourceInfo(asn::GetOctetString(container->rRCContainer));
++            if (info.has_value())
++                ueSti = info->ueSti;
++            asn::Free(asn_DEF_ASN_NGAP_SourceNGRANNode_ToTargetNGRANNode_TransparentContainer, container);
++        }
++    }
++    if (ueSti == 0)
++    {
++        m_logger->err("N2 handover: cannot resolve the simulated UE identity, ignoring the Handover Request");
++        return;
++    }
++
++    // Drop a possibly stale pending handover for the same UE (e.g. a repeated handover)
++    cancelPendingHandover(ueSti, "replaced by a new Handover Request");
++
++    // Create a provisional UE context. The final context id (the RLS UE id) is not known until the
++    // UE appears on the target cell, hence a temporary negative id is used until that point.
++    auto provisionalUeId = -(++m_handoverTempIdCounter);
++    auto *ue = new NgapUeContext(provisionalUeId);
++    ue->amfUeNgapId = amfUeNgapId;
++    ue->ranUeNgapId = ++m_ueNgapIdCounter;
++    ue->associatedAmfId = amfId;
++    ue->sti = ueSti;
++    ue->uplinkStream = stream;
++    m_ueCtx[provisionalUeId] = ue;
++
++    auto *ieAmbr = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UEAggregateMaximumBitRate);
++    if (ieAmbr != nullptr)
++    {
++        ue->ueAmbr.dlAmbr = asn::GetUnsigned64(ieAmbr->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateDL) / 8ull;
++        ue->ueAmbr.ulAmbr = asn::GetUnsigned64(ieAmbr->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateUL) / 8ull;
++    }
++
++    // PDU session resource allocation
++    std::vector<PduSessionResource *> sessions;
++    std::vector<ASN_NGAP_PDUSessionResourceAdmittedItem *> admittedList;
++    std::vector<ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck *> failedList;
++    int offeredCount = 0;
++
++    auto *ieSetupList = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListHOReq);
++    if (ieSetupList != nullptr)
++    {
++        auto &list = ieSetupList->PDUSessionResourceSetupListHOReq.list;
++        for (int i = 0; i < list.count; i++)
++        {
++            auto &item = list.array[i];
++            offeredCount++;
++
++            auto *transfer = ngap_encode::Decode<ASN_NGAP_PDUSessionResourceSetupRequestTransfer>(
++                asn_DEF_ASN_NGAP_PDUSessionResourceSetupRequestTransfer, item->handoverRequestTransfer);
++            if (transfer == nullptr)
++            {
++                m_logger->err("N2 handover: unable to decode a PDU session resource setup request transfer");
++                auto *failedItem =
++                    CreateUnsuccessfulSessionItem(static_cast<int>(item->pDUSessionID),
++                                                  NgapCause::Protocol_transfer_syntax_error, *m_logger);
++                if (failedItem != nullptr)
++                    failedList.push_back(failedItem);
++                continue;
++            }
++
++            auto *resource = new PduSessionResource(provisionalUeId, static_cast<int>(item->pDUSessionID));
++            FillPduSessionResourceFromTransfer(transfer, resource);
++            asn::Free(asn_DEF_ASN_NGAP_PDUSessionResourceSetupRequestTransfer, transfer);
++
++            auto error = ValidateSessionResource(resource);
++            if (error.has_value())
++            {
++                m_logger->err("N2 handover: PDU session[%d] cannot be admitted for UE[%d] (not a supported IPv4 "
++                              "session or missing resource parameters)",
++                              resource->psi, provisionalUeId);
++                auto *failedItem = CreateUnsuccessfulSessionItem(resource->psi, error.value(), *m_logger);
++                if (failedItem != nullptr)
++                    failedList.push_back(failedItem);
++                delete resource;
++                continue;
++            }
++
++            // Allocate this gNB's downlink N3 tunnel endpoint for the session
++            std::string gtpIp = m_base->config->gtpAdvertiseIp.value_or(m_base->config->gtpIp);
++            resource->downTunnel.address = utils::IpToOctetString(gtpIp);
++            resource->downTunnel.teid = ++m_downlinkTeidCounter;
++
++            // Handover Request Acknowledge Transfer: DL N3 TNL information and admitted QoS flows
++            auto *ackTransfer = asn::New<ASN_NGAP_HandoverRequestAcknowledgeTransfer>();
++            auto &dlInfo = ackTransfer->dL_NGU_UP_TNLInformation;
++            dlInfo.present = ASN_NGAP_UPTransportLayerInformation_PR_gTPTunnel;
++            dlInfo.choice.gTPTunnel = asn::New<ASN_NGAP_GTPTunnel>();
++            asn::SetBitString(dlInfo.choice.gTPTunnel->transportLayerAddress, resource->downTunnel.address);
++            asn::SetOctetString4(dlInfo.choice.gTPTunnel->gTP_TEID, (octet4)resource->downTunnel.teid);
++
++            auto &qosList = resource->qosFlows->list;
++            for (int q = 0; q < qosList.count; q++)
++            {
++                auto *qosItem = asn::New<ASN_NGAP_QosFlowItemWithDataForwarding>();
++                qosItem->qosFlowIdentifier = qosList.array[q]->qosFlowIdentifier;
++                ASN_SEQUENCE_ADD(&ackTransfer->qosFlowSetupResponseList.list, qosItem);
++            }
++
++            OctetString encodedAckTransfer =
++                ngap_encode::EncodeS(asn_DEF_ASN_NGAP_HandoverRequestAcknowledgeTransfer, ackTransfer);
++            if (encodedAckTransfer.length() == 0)
++            {
++                m_logger->err("N2 handover: HandoverRequestAcknowledgeTransfer encoding failed");
++                asn::Free(asn_DEF_ASN_NGAP_HandoverRequestAcknowledgeTransfer, ackTransfer);
++                auto *failedItem = CreateUnsuccessfulSessionItem(resource->psi, NgapCause::Protocol_unspecified, *m_logger);
++                if (failedItem != nullptr)
++                    failedList.push_back(failedItem);
++                delete resource;
++                continue;
++            }
++            asn::Free(asn_DEF_ASN_NGAP_HandoverRequestAcknowledgeTransfer, ackTransfer);
++
++            auto *admittedItem = asn::New<ASN_NGAP_PDUSessionResourceAdmittedItem>();
++            admittedItem->pDUSessionID = static_cast<ASN_NGAP_PDUSessionID_t>(resource->psi);
++            asn::SetOctetString(admittedItem->handoverRequestAcknowledgeTransfer, encodedAckTransfer);
++            admittedList.push_back(admittedItem);
++            sessions.push_back(resource);
++        }
++    }
++
++    // All requested sessions were rejected: answer with Handover Failure
++    if (offeredCount > 0 && admittedList.empty())
++    {
++        m_logger->err("N2 handover: all PDU sessions were rejected, sending Handover Failure");
++
++        for (auto *failedItem : failedList)
++            asn::Free(asn_DEF_ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck, failedItem);
++
++        std::vector<ASN_NGAP_HandoverFailureIEs *> failureIes;
++        auto *ieCause = asn::New<ASN_NGAP_HandoverFailureIEs>();
++        ieCause->id = ASN_NGAP_ProtocolIE_ID_id_Cause;
++        ieCause->criticality = ASN_NGAP_Criticality_ignore;
++        ieCause->value.present = ASN_NGAP_HandoverFailureIEs__value_PR_Cause;
++        ngap_utils::ToCauseAsn_Ref(NgapCause::RadioNetwork_no_radio_resources_available_in_target_cell,
++                                   ieCause->value.choice.Cause);
++        failureIes.push_back(ieCause);
++
++        sendNgapUeAssociated(provisionalUeId, asn::ngap::NewMessagePdu<ASN_NGAP_HandoverFailure>(failureIes));
++        deleteUeContext(provisionalUeId);
++        return;
++    }
++
++    // Build the Handover Request Acknowledge
++    std::vector<ASN_NGAP_HandoverRequestAcknowledgeIEs *> responseIes;
++
++    if (!admittedList.empty())
++    {
++        auto *ie = asn::New<ASN_NGAP_HandoverRequestAcknowledgeIEs>();
++        ie->id = ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceAdmittedList;
++        ie->criticality = ASN_NGAP_Criticality_ignore;
++        ie->value.present = ASN_NGAP_HandoverRequestAcknowledgeIEs__value_PR_PDUSessionResourceAdmittedList;
++        for (auto *item : admittedList)
++            asn::SequenceAdd(ie->value.choice.PDUSessionResourceAdmittedList, item);
++        responseIes.push_back(ie);
++    }
++
++    if (!failedList.empty())
++    {
++        auto *ie = asn::New<ASN_NGAP_HandoverRequestAcknowledgeIEs>();
++        ie->id = ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceFailedToSetupListHOAck;
++        ie->criticality = ASN_NGAP_Criticality_ignore;
++        ie->value.present = ASN_NGAP_HandoverRequestAcknowledgeIEs__value_PR_PDUSessionResourceFailedToSetupListHOAck;
++        for (auto *item : failedList)
++            asn::SequenceAdd(ie->value.choice.PDUSessionResourceFailedToSetupListHOAck, item);
++        responseIes.push_back(ie);
++    }
++
++    // Target To Source Transparent Container (carries the simulated handover command)
++    auto *ieTargetToSource = asn::New<ASN_NGAP_HandoverRequestAcknowledgeIEs>();
++    ieTargetToSource->id = ASN_NGAP_ProtocolIE_ID_id_TargetToSource_TransparentContainer;
++    ieTargetToSource->criticality = ASN_NGAP_Criticality_reject;
++    ieTargetToSource->value.present =
++        ASN_NGAP_HandoverRequestAcknowledgeIEs__value_PR_TargetToSource_TransparentContainer;
++
++    ho::CommandInfo commandInfo{};
++    commandInfo.targetNci = static_cast<uint64_t>(m_base->config->nci);
++
++    auto *targetToSourceContainer = asn::New<ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer>();
++    asn::SetOctetString(targetToSourceContainer->rRCContainer, ho::EncodeCommandInfo(commandInfo));
++    OctetString encodedTargetToSource = ngap_encode::EncodeS(
++        asn_DEF_ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer, targetToSourceContainer);
++    if (encodedTargetToSource.length() == 0)
++    {
++        asn::Free(asn_DEF_ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer, targetToSourceContainer);
++        m_logger->err("N2 handover: target-to-source transparent container encoding failed");
++        for (auto *session : sessions)
++            delete session;
++        deleteUeContext(provisionalUeId);
++        return;
++    }
++    asn::Free(asn_DEF_ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer, targetToSourceContainer);
++    asn::SetOctetString(ieTargetToSource->value.choice.TargetToSource_TransparentContainer, encodedTargetToSource);
++    responseIes.push_back(ieTargetToSource);
++
++    // Remember the prepared handover until the UE appears on the target cell
++    auto *pending = new PendingHandover();
++    pending->sti = ueSti;
++    pending->provisionalUeId = provisionalUeId;
++    pending->amfCtxId = amfId;
++    pending->amfUeNgapId = amfUeNgapId;
++    pending->ranUeNgapId = ue->ranUeNgapId;
++    pending->ueAmbr = ue->ueAmbr;
++    pending->sessions = std::move(sessions);
++    pending->createdTime = utils::CurrentTimeMillis();
++    m_pendingHandovers[ueSti] = pending;
++
++    m_logger->info("N2 handover: Handover Request accepted for UE(sti[%llu]), %d session(s) admitted, %d rejected",
++                   (unsigned long long)ueSti, static_cast<int>(admittedList.size()), static_cast<int>(failedList.size()));
++
++    sendNgapUeAssociated(provisionalUeId,
++                         asn::ngap::NewMessagePdu<ASN_NGAP_HandoverRequestAcknowledge>(responseIes));
++}
++
++void NgapTask::receiveHandoverCommand(int amfId, ASN_NGAP_HandoverCommand *msg)
++{
++    m_logger->debug("N2 handover: Handover Command received from AMF[%d]", amfId);
++
++    auto idPair = ngap_utils::FindNgapIdPair(msg);
++
++    // Tolerant lookup: some AMF implementations (e.g. free5GC) may change the AMF-UE-NGAP-ID during
++    // the handover procedure, which is not expected by TS 38.413. The RAN UE NGAP ID is stable, so
++    // the UE is looked up by that id and a changed AMF id is adopted with a warning.
++    NgapUeContext *ue = nullptr;
++    if (idPair.ranUeNgapId.has_value())
++        ue = findUeByRanId(idPair.ranUeNgapId.value());
++    if (ue == nullptr && idPair.amfUeNgapId.has_value())
++        ue = findUeByAmfId(idPair.amfUeNgapId.value());
++    if (ue == nullptr)
++    {
++        m_logger->err("N2 handover: UE context not found for the Handover Command");
++        return;
++    }
++    if (idPair.amfUeNgapId.has_value() && ue->amfUeNgapId != idPair.amfUeNgapId.value())
++    {
++        m_logger->warn("N2 handover: AMF-UE-NGAP-ID changed from %ld to %ld during the handover, adopting the new id",
++                       ue->amfUeNgapId, idPair.amfUeNgapId.value());
++        ue->amfUeNgapId = idPair.amfUeNgapId.value();
++    }
++
++    // Extract the RRC container (the simulated handover command) from the target-to-source container
++    auto *ieContainer = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_TargetToSource_TransparentContainer);
++    if (ieContainer == nullptr)
++    {
++        m_logger->err("N2 handover: Handover Command without a target-to-source transparent container");
++        return;
++    }
++
++    OctetString rrcContainer;
++    {
++        auto *container = ngap_encode::Decode<ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer>(
++            asn_DEF_ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer,
++            ieContainer->TargetToSource_TransparentContainer);
++        if (container != nullptr)
++        {
++            rrcContainer = asn::GetOctetString(container->rRCContainer);
++            asn::Free(asn_DEF_ASN_NGAP_TargetNGRANNode_ToSourceNGRANNode_TransparentContainer, container);
++        }
++    }
++    if (rrcContainer.length() == 0)
++    {
++        m_logger->err("N2 handover: cannot extract the handover command payload");
++        return;
++    }
++
++    auto w = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::HANDOVER);
++    w->ueId = ue->ctxId;
++    w->rrcContainer = std::move(rrcContainer);
++    m_base->rrcTask->push(std::move(w));
++
++    m_logger->info("N2 handover: Handover Command received, forwarding the handover command to UE[%d]", ue->ctxId);
++}
++
++void NgapTask::handleHandoverConfirm(int ueId, uint64_t sti)
++{
++    auto it = m_pendingHandovers.find(sti);
++    if (it == m_pendingHandovers.end())
++    {
++        m_logger->warn("N2 handover: handover confirm from UE[%d] (sti[%llu]) without a matching pending handover", ueId,
++                       (unsigned long long)sti);
++        return;
++    }
++    auto *pending = it->second;
++
++    m_logger->info("N2 handover: UE[%d] appeared on the target cell (sti[%llu])", ueId, (unsigned long long)sti);
++
++    // Release a possibly stale context that occupies the same UE id (e.g. handover back to this node)
++    if (m_ueCtx.count(ueId) != 0)
++    {
++        auto wRelease = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_RELEASE);
++        wRelease->ueId = ueId;
++        m_base->gtpTask->push(std::move(wRelease));
++        deleteUeContext(ueId);
++    }
++
++    // Drop the provisional context; the final context reuses the RAN UE NGAP ID that was
++    // already advertised to the AMF in the Handover Request Acknowledge.
++    deleteUeContext(pending->provisionalUeId);
++
++    auto *ue = new NgapUeContext(ueId);
++    ue->amfUeNgapId = pending->amfUeNgapId;
++    ue->ranUeNgapId = pending->ranUeNgapId;
++    ue->associatedAmfId = pending->amfCtxId;
++    ue->ueAmbr = pending->ueAmbr;
++    ue->sti = sti;
++    m_ueCtx[ueId] = ue;
++
++    // Materialize the prepared PDU sessions in the GTP layer
++    auto wCtx = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_UPDATE);
++    wCtx->update = std::make_unique<GtpUeContextUpdate>(true, ueId, ue->ueAmbr);
++    m_base->gtpTask->push(std::move(wCtx));
++
++    for (auto *prepared : pending->sessions)
++    {
++        auto *resource = new PduSessionResource(ueId, prepared->psi);
++        resource->sessionAmbr = prepared->sessionAmbr;
++        resource->dataForwardingNotPossible = prepared->dataForwardingNotPossible;
++        resource->sessionType = prepared->sessionType;
++        resource->upTunnel = std::move(prepared->upTunnel);
++        resource->downTunnel = std::move(prepared->downTunnel);
++        resource->qosFlows = std::move(prepared->qosFlows);
++        delete prepared;
++
++        auto wSession = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::SESSION_CREATE);
++        wSession->resource = resource;
++        m_base->gtpTask->push(std::move(wSession));
++
++        ue->pduSessions.insert(resource->psi);
++    }
++
++    delete pending;
++    m_pendingHandovers.erase(it);
++
++    sendHandoverNotify(ueId);
++}
++
++void NgapTask::sendHandoverNotify(int ueId)
++{
++    auto *ue = findUeContext(ueId);
++    if (ue == nullptr)
++        return;
++
++    std::vector<ASN_NGAP_HandoverNotifyIEs *> ies;
++    auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_HandoverNotify>(ies);
++    sendNgapUeAssociated(ueId, pdu);
++
++    m_logger->info("N2 handover: Handover Notify sent for UE[%d]", ueId);
++}
++
++void NgapTask::receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg)
++{
++    auto *ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_Cause);
++    if (ie != nullptr)
++        m_logger->err("N2 handover: handover preparation failure, cause[%s]",
++                      ngap_utils::CauseToString(ie->Cause).c_str());
++    else
++        m_logger->err("N2 handover: handover preparation failure");
++}
++
++void NgapTask::cancelPendingHandover(uint64_t ueSti, const char *reason)
++{
++    auto it = m_pendingHandovers.find(ueSti);
++    if (it == m_pendingHandovers.end())
++        return;
++
++    auto *pending = it->second;
++    m_logger->warn("N2 handover: cancelling pending handover for sti[%llu] (%s)", (unsigned long long)ueSti, reason);
++
++    deleteUeContext(pending->provisionalUeId);
++    for (auto *session : pending->sessions)
++        delete session;
++    delete pending;
++    m_pendingHandovers.erase(it);
++}
++
++void NgapTask::cleanupPendingHandovers()
++{
++    int64_t current = utils::CurrentTimeMillis();
++
++    std::vector<uint64_t> expired;
++    for (auto &item : m_pendingHandovers)
++    {
++        if (current - item.second->createdTime > 60'000)
++            expired.push_back(item.first);
++    }
++
++    for (auto sti : expired)
++        cancelPendingHandover(sti, "timed out while waiting for the UE on the target cell");
++}
++
++} // namespace nr::gnb
+diff --git a/src/gnb/ngap/management.cpp b/src/gnb/ngap/management.cpp
+index 2b0ec94..1721036 100644
+--- a/src/gnb/ngap/management.cpp
++++ b/src/gnb/ngap/management.cpp
+@@ -33,11 +33,12 @@ void NgapTask::createAmfContext(const GnbAmfConfig &conf)
+     m_amfCtx[ctx->ctxId] = ctx;
+ }
+ 
+-void NgapTask::createUeContext(int ueId, int32_t &requestedSliceType)
++void NgapTask::createUeContext(int ueId, int32_t &requestedSliceType, uint64_t sti)
+ {
+     auto *ctx = new NgapUeContext(ueId);
+     ctx->amfUeNgapId = -1;
+     ctx->ranUeNgapId = ++m_ueNgapIdCounter;
++    ctx->sti = sti;
+ 
+     m_ueCtx[ctx->ctxId] = ctx;
+ 
+diff --git a/src/gnb/ngap/nas.cpp b/src/gnb/ngap/nas.cpp
+index 6bd6beb..58a89c2 100644
+--- a/src/gnb/ngap/nas.cpp
++++ b/src/gnb/ngap/nas.cpp
+@@ -63,7 +63,7 @@ int32_t extractSliceInfoAndModifyPdu(OctetString &nasPdu) {
+ }
+ 
+ void NgapTask::handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t rrcEstablishmentCause,
+-                                            const std::optional<GutiMobileIdentity> &sTmsi)
++                                            const std::optional<GutiMobileIdentity> &sTmsi, uint64_t sti)
+ {
+     int32_t requestedSliceType = extractSliceInfoAndModifyPdu(nasPdu);
+ 
+@@ -75,7 +75,7 @@ void NgapTask::handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t
+         return;
+     }
+ 
+-    createUeContext(ueId, requestedSliceType);
++    createUeContext(ueId, requestedSliceType, sti);
+ 
+     auto *ueCtx = findUeContext(ueId);
+     if (ueCtx == nullptr)
+diff --git a/src/gnb/ngap/task.cpp b/src/gnb/ngap/task.cpp
+index b0abae9..a942dd5 100644
+--- a/src/gnb/ngap/task.cpp
++++ b/src/gnb/ngap/task.cpp
+@@ -28,6 +28,8 @@ void NgapTask::onStart()
+     if (m_amfCtx.empty())
+         m_logger->warn("No AMF configuration is provided");
+ 
++    setTimer(TIMER_ID_HANDOVER_CLEANUP, 5000);
++
+     for (auto &amfCtx : m_amfCtx)
+     {
+         auto msg = std::make_unique<NmGnbSctp>(NmGnbSctp::CONNECTION_REQUEST);
+@@ -55,7 +57,7 @@ void NgapTask::onLoop()
+         switch (w.present)
+         {
+         case NmGnbRrcToNgap::INITIAL_NAS_DELIVERY: {
+-            handleInitialNasTransport(w.ueId, w.pdu, w.rrcEstablishmentCause, w.sTmsi);
++            handleInitialNasTransport(w.ueId, w.pdu, w.rrcEstablishmentCause, w.sTmsi, w.sti);
+             break;
+         }
+         case NmGnbRrcToNgap::UPLINK_NAS_DELIVERY: {
+@@ -66,6 +68,19 @@ void NgapTask::onLoop()
+             handleRadioLinkFailure(w.ueId);
+             break;
+         }
++        case NmGnbRrcToNgap::HANDOVER_CONFIRM: {
++            handleHandoverConfirm(w.ueId, w.sti);
++            break;
++        }
++        }
++        break;
++    }
++    case NtsMessageType::TIMER_EXPIRED: {
++        auto &w = dynamic_cast<NmTimerExpired &>(*msg);
++        if (w.timerId == TIMER_ID_HANDOVER_CLEANUP)
++        {
++            setTimer(TIMER_ID_HANDOVER_CLEANUP, 5000);
++            cleanupPendingHandovers();
+         }
+         break;
+     }
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+index 14ea956..5b44769 100644
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -8,8 +8,10 @@
+ 
+ #pragma once
+ 
++#include <cstdint>
+ #include <optional>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include <gnb/nts.hpp>
+ #include <gnb/types.hpp>
+@@ -34,6 +36,10 @@ extern "C"
+     struct ASN_NGAP_OverloadStop;
+     struct ASN_NGAP_PDUSessionResourceReleaseCommand;
+     struct ASN_NGAP_Paging;
++    struct ASN_NGAP_HandoverRequired;
++    struct ASN_NGAP_HandoverRequest;
++    struct ASN_NGAP_HandoverCommand;
++    struct ASN_NGAP_HandoverPreparationFailure;
+ }
+ 
+ namespace nr::gnb
+@@ -56,6 +62,25 @@ class NgapTask : public NtsTask
+     uint32_t m_downlinkTeidCounter;
+     bool m_isInitialized;
+ 
++    /* N2 handover: prepared (but not yet accessed) target-side handover state, keyed by the
++     * simulated radio identity (RLS STI) of the UE. */
++    struct PendingHandover
++    {
++        uint64_t sti{};
++        int provisionalUeId{};
++        int amfCtxId{};
++        int64_t amfUeNgapId{};
++        int64_t ranUeNgapId{};
++        int64_t createdTime{};
++        AggregateMaximumBitRate ueAmbr{};
++        std::vector<PduSessionResource *> sessions{};
++    };
++
++    std::unordered_map<uint64_t, PendingHandover *> m_pendingHandovers{};
++    int m_handoverTempIdCounter{};
++
++    static constexpr int TIMER_ID_HANDOVER_CLEANUP = 101;
++
+     friend class GnbCmdHandler;
+ 
+   public:
+@@ -71,7 +96,7 @@ class NgapTask : public NtsTask
+     /* Utility functions */
+     void createAmfContext(const GnbAmfConfig &config);
+     NgapAmfContext *findAmfContext(int ctxId);
+-    void createUeContext(int ueId, int32_t &requestedSliceType);
++    void createUeContext(int ueId, int32_t &requestedSliceType, uint64_t sti = 0);
+     NgapUeContext *findUeContext(int ctxId);
+     NgapUeContext *findUeByRanId(int64_t ranUeNgapId);
+     NgapUeContext *findUeByAmfId(int64_t amfUeNgapId);
+@@ -99,7 +124,7 @@ class NgapTask : public NtsTask
+ 
+     /* NAS transport */
+     void handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t rrcEstablishmentCause,
+-                                   const std::optional<GutiMobileIdentity> &sTmsi);
++                                   const std::optional<GutiMobileIdentity> &sTmsi, uint64_t sti);
+     void handleUplinkNasTransport(int ueId, const OctetString &nasPdu);
+     void receiveDownlinkNasTransport(int amfId, ASN_NGAP_DownlinkNASTransport *msg);
+     void deliverDownlinkNas(int ueId, OctetString &&nasPdu);
+@@ -124,6 +149,16 @@ class NgapTask : public NtsTask
+     /* Radio resource control */
+     void handleRadioLinkFailure(int ueId);
+     void receivePaging(int amfId, ASN_NGAP_Paging *msg);
++
++    /* N2 handover (simulation) */
++    void sendHandoverRequired(int ueId, int gnbTargetId);
++    void receiveHandoverRequest(int amfId, uint16_t stream, ASN_NGAP_HandoverRequest *msg);
++    void receiveHandoverCommand(int amfId, ASN_NGAP_HandoverCommand *msg);
++    void handleHandoverConfirm(int ueId, uint64_t sti);
++    void sendHandoverNotify(int ueId);
++    void receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg);
++    void cancelPendingHandover(uint64_t ueSti, const char *reason);
++    void cleanupPendingHandovers();
+ };
+ 
+ } // namespace nr::gnb
+\ No newline at end of file
+diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
+index 46c5862..81b11bf 100644
+--- a/src/gnb/ngap/transport.cpp
++++ b/src/gnb/ngap/transport.cpp
+@@ -327,6 +327,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+         case ASN_NGAP_InitiatingMessage__value_PR_Paging:
+             receivePaging(amf->ctxId, &value.choice.Paging);
+             break;
++        case ASN_NGAP_InitiatingMessage__value_PR_HandoverRequest:
++            receiveHandoverRequest(amf->ctxId, stream, &value.choice.HandoverRequest);
++            break;
+         default:
+             m_logger->err("Unhandled NGAP initiating-message received (%d)", value.present);
+             break;
+@@ -340,6 +343,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+         case ASN_NGAP_SuccessfulOutcome__value_PR_NGSetupResponse:
+             receiveNgSetupResponse(amf->ctxId, &value.choice.NGSetupResponse);
+             break;
++        case ASN_NGAP_SuccessfulOutcome__value_PR_HandoverCommand:
++            receiveHandoverCommand(amf->ctxId, &value.choice.HandoverCommand);
++            break;
+         default:
+             m_logger->err("Unhandled NGAP successful-outcome received (%d)", value.present);
+             break;
+@@ -353,6 +359,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+         case ASN_NGAP_UnsuccessfulOutcome__value_PR_NGSetupFailure:
+             receiveNgSetupFailure(amf->ctxId, &value.choice.NGSetupFailure);
+             break;
++        case ASN_NGAP_UnsuccessfulOutcome__value_PR_HandoverPreparationFailure:
++            receiveHandoverPreparationFailure(&value.choice.HandoverPreparationFailure);
++            break;
+         default:
+             m_logger->err("Unhandled NGAP unsuccessful-outcome received (%d)", value.present);
+             break;
+@@ -371,6 +380,13 @@ bool NgapTask::handleSctpStreamId(int amfId, int stream, const ASN_NGAP_NGAP_PDU
+     if (m_base->config->ignoreStreamIds)
+         return true;
+ 
++    // The Handover Request is a UE-associated message but carries no UE NGAP IDs (the target gNB
++    // has no context for the UE yet), therefore it is accepted on any stream.
++    if (pdu.present == ASN_NGAP_NGAP_PDU_PR_initiatingMessage &&
++        pdu.choice.initiatingMessage->procedureCode == ASN_NGAP_ProcedureCode_id_HandoverResourceAllocation &&
++        pdu.choice.initiatingMessage->value.present == ASN_NGAP_InitiatingMessage__value_PR_HandoverRequest)
++        return true;
++
+     auto *ptr =
+         asn::ngap::FindProtocolIeInPdu(pdu, asn_DEF_ASN_NGAP_UE_NGAP_IDs, ASN_NGAP_ProtocolIE_ID_id_UE_NGAP_IDs);
+     if (ptr != nullptr)
+diff --git a/src/gnb/nts.hpp b/src/gnb/nts.hpp
+index ae328ee..4c83087 100644
+--- a/src/gnb/nts.hpp
++++ b/src/gnb/nts.hpp
+@@ -44,6 +44,10 @@ struct NmGnbRlsToRrc : NtsMessage
+     // UPLINK_RRC
+     int ueId{};
+ 
++    // SIGNAL_DETECTED
++    // UPLINK_RRC
++    uint64_t sti{};
++
+     // UPLINK_RRC
+     OctetString data;
+     rrc::RrcChannel rrcChannel{};
+@@ -110,6 +114,10 @@ struct NmGnbRlsToRls : NtsMessage
+     // UPLINK_RRC
+     int ueId{};
+ 
++    // SIGNAL_DETECTED
++    // UPLINK_RRC
++    uint64_t sti{};
++
+     // RECEIVE_RLS_MESSAGE
+     std::unique_ptr<rls::RlsMessage> msg{};
+ 
+@@ -166,15 +174,20 @@ struct NmGnbNgapToRrc : NtsMessage
+         NAS_DELIVERY,
+         AN_RELEASE,
+         PAGING,
++        HANDOVER,
+     } present;
+ 
+     // NAS_DELIVERY
+     // AN_RELEASE
++    // HANDOVER
+     int ueId{};
+ 
+     // NAS_DELIVERY
+     OctetString pdu{};
+ 
++    // HANDOVER (simulated handover command payload)
++    OctetString rrcContainer{};
++
+     // PAGING
+     asn::Unique<ASN_NGAP_FiveG_S_TMSI> uePagingTmsi{};
+     asn::Unique<ASN_NGAP_TAIListForPaging> taiListForPaging{};
+@@ -190,12 +203,14 @@ struct NmGnbRrcToNgap : NtsMessage
+     {
+         INITIAL_NAS_DELIVERY,
+         UPLINK_NAS_DELIVERY,
+-        RADIO_LINK_FAILURE
++        RADIO_LINK_FAILURE,
++        HANDOVER_CONFIRM,
+     } present;
+ 
+     // INITIAL_NAS_DELIVERY
+     // UPLINK_NAS_DELIVERY
+     // RADIO_LINK_FAILURE
++    // HANDOVER_CONFIRM
+     int ueId{};
+ 
+     // INITIAL_NAS_DELIVERY
+@@ -206,6 +221,10 @@ struct NmGnbRrcToNgap : NtsMessage
+     int64_t rrcEstablishmentCause{};
+     std::optional<GutiMobileIdentity> sTmsi{};
+ 
++    // INITIAL_NAS_DELIVERY
++    // HANDOVER_CONFIRM
++    uint64_t sti{};
++
+     explicit NmGnbRrcToNgap(PR present) : NtsMessage(NtsMessageType::GNB_RRC_TO_NGAP), present(present)
+     {
+     }
+diff --git a/src/gnb/rls/ctl_task.cpp b/src/gnb/rls/ctl_task.cpp
+index cebf25b..ec69e67 100644
+--- a/src/gnb/rls/ctl_task.cpp
++++ b/src/gnb/rls/ctl_task.cpp
+@@ -54,7 +54,7 @@ void RlsControlTask::onLoop()
+         switch (w.present)
+         {
+         case NmGnbRlsToRls::SIGNAL_DETECTED:
+-            handleSignalDetected(w.ueId);
++            handleSignalDetected(w.ueId, w.sti);
+             break;
+         case NmGnbRlsToRls::SIGNAL_LOST:
+             handleSignalLost(w.ueId);
+@@ -98,10 +98,11 @@ void RlsControlTask::onQuit()
+ {
+ }
+ 
+-void RlsControlTask::handleSignalDetected(int ueId)
++void RlsControlTask::handleSignalDetected(int ueId, uint64_t sti)
+ {
+     auto w = std::make_unique<NmGnbRlsToRls>(NmGnbRlsToRls::SIGNAL_DETECTED);
+     w->ueId = ueId;
++    w->sti = sti;
+     m_mainTask->push(std::move(w));
+ }
+ 
+@@ -130,6 +131,7 @@ void RlsControlTask::handleRlsMessage(int ueId, rls::RlsMessage &msg)
+         {
+             auto w = std::make_unique<NmGnbRlsToRls>(NmGnbRlsToRls::UPLINK_DATA);
+             w->ueId = ueId;
++            w->sti = m.sti;
+             w->psi = static_cast<int>(m.payload);
+             w->data = std::move(m.pdu);
+             m_mainTask->push(std::move(w));
+@@ -144,6 +146,7 @@ void RlsControlTask::handleRlsMessage(int ueId, rls::RlsMessage &msg)
+ 
+             auto w = std::make_unique<NmGnbRlsToRls>(NmGnbRlsToRls::UPLINK_RRC);
+             w->ueId = ueId;
++            w->sti = m.sti;
+             w->rrcChannel = static_cast<rrc::RrcChannel>(m.payload);
+             w->data = std::move(m.pdu);
+             m_mainTask->push(std::move(w));
+diff --git a/src/gnb/rls/ctl_task.hpp b/src/gnb/rls/ctl_task.hpp
+index 7bd4e40..eeceafb 100644
+--- a/src/gnb/rls/ctl_task.hpp
++++ b/src/gnb/rls/ctl_task.hpp
+@@ -40,7 +40,7 @@ class RlsControlTask : public NtsTask
+     void initialize(NtsTask *mainTask, RlsUdpTask *udpTask);
+ 
+   private:
+-    void handleSignalDetected(int ueId);
++    void handleSignalDetected(int ueId, uint64_t sti);
+     void handleSignalLost(int ueId);
+     void handleRlsMessage(int ueId, rls::RlsMessage &msg);
+     void handleDownlinkRrcDelivery(int ueId, uint32_t pduId, rrc::RrcChannel channel, OctetString &&data);
+diff --git a/src/gnb/rls/task.cpp b/src/gnb/rls/task.cpp
+index b31f64c..df3ac75 100644
+--- a/src/gnb/rls/task.cpp
++++ b/src/gnb/rls/task.cpp
+@@ -49,6 +49,7 @@ void GnbRlsTask::onLoop()
+         case NmGnbRlsToRls::SIGNAL_DETECTED: {
+             auto m = std::make_unique<NmGnbRlsToRrc>(NmGnbRlsToRrc::SIGNAL_DETECTED);
+             m->ueId = w.ueId;
++            m->sti = w.sti;
+             m_base->rrcTask->push(std::move(m));
+             break;
+         }
+@@ -67,6 +68,7 @@ void GnbRlsTask::onLoop()
+         case NmGnbRlsToRls::UPLINK_RRC: {
+             auto m = std::make_unique<NmGnbRlsToRrc>(NmGnbRlsToRrc::UPLINK_RRC);
+             m->ueId = w.ueId;
++            m->sti = w.sti;
+             m->rrcChannel = w.rrcChannel;
+             m->data = std::move(w.data);
+             m_base->rrcTask->push(std::move(m));
+diff --git a/src/gnb/rls/udp_task.cpp b/src/gnb/rls/udp_task.cpp
+index 46a42d8..bcae397 100644
+--- a/src/gnb/rls/udp_task.cpp
++++ b/src/gnb/rls/udp_task.cpp
+@@ -127,6 +127,7 @@ void RlsUdpTask::receiveRlsPdu(const InetAddress &addr, std::unique_ptr<rls::Rls
+ 
+             auto w = std::make_unique<NmGnbRlsToRls>(NmGnbRlsToRls::SIGNAL_DETECTED);
+             w->ueId = ueId;
++            w->sti = msg->sti;
+             m_ctlTask->push(std::move(w));
+         }
+ 
+diff --git a/src/gnb/rrc/channel.cpp b/src/gnb/rrc/channel.cpp
+index 9615982..9787dbf 100644
+--- a/src/gnb/rrc/channel.cpp
++++ b/src/gnb/rrc/channel.cpp
+@@ -190,7 +190,8 @@ void GnbRrcTask::receiveRrcMessage(int ueId, ASN_RRC_UL_DCCH_Message *msg)
+     case ASN_RRC_UL_DCCH_MessageType__c1_PR_measurementReport:
+         break; // TODO
+     case ASN_RRC_UL_DCCH_MessageType__c1_PR_rrcReconfigurationComplete:
+-        break; // TODO
++        receiveRrcHandoverConfirm(ueId, *c1->choice.rrcReconfigurationComplete);
++        break;
+     case ASN_RRC_UL_DCCH_MessageType__c1_PR_rrcSetupComplete:
+         receiveRrcSetupComplete(ueId, *c1->choice.rrcSetupComplete);
+         break;
+diff --git a/src/gnb/rrc/connection.cpp b/src/gnb/rrc/connection.cpp
+index 0020ac6..9048b46 100644
+--- a/src/gnb/rrc/connection.cpp
++++ b/src/gnb/rrc/connection.cpp
+@@ -128,6 +128,7 @@ void GnbRrcTask::receiveRrcSetupComplete(int ueId, const ASN_RRC_RRCSetupComplet
+     w->pdu = asn::GetOctetString(setupComplete->dedicatedNAS_Message);
+     w->rrcEstablishmentCause = ue->establishmentCause;
+     w->sTmsi = ue->sTmsi;
++    w->sti = m_ueSti.count(ueId) != 0 ? m_ueSti[ueId] : 0;
+ 
+     m_base->ngapTask->push(std::move(w));
+ }
+diff --git a/src/gnb/rrc/handover.cpp b/src/gnb/rrc/handover.cpp
+new file mode 100644
+index 0000000..215db5c
+--- /dev/null
++++ b/src/gnb/rrc/handover.cpp
+@@ -0,0 +1,66 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++// gNB side RRC handlers for the N2 handover simulation.
++//
++// On the source gNB the handover command received over NGAP is forwarded to the UE inside an
++// RRC Reconfiguration message. On the target gNB the RRC Reconfiguration Complete message sent
++// by the UE completes the radio part of the handover and triggers the Handover Notify.
++
++#include "task.hpp"
++
++#include <gnb/ngap/task.hpp>
++#include <lib/rrc/encode.hpp>
++
++#include <asn/rrc/ASN_RRC_DL-DCCH-Message.h>
++#include <asn/rrc/ASN_RRC_RRCReconfiguration-IEs.h>
++#include <asn/rrc/ASN_RRC_RRCReconfiguration.h>
++
++namespace nr::gnb
++{
++
++void GnbRrcTask::handleHandoverCommand(int ueId, const OctetString &rrcContainer)
++{
++    auto *pdu = asn::New<ASN_RRC_DL_DCCH_Message>();
++    pdu->message.present = ASN_RRC_DL_DCCH_MessageType_PR_c1;
++    pdu->message.choice.c1 = asn::NewFor(pdu->message.choice.c1);
++    pdu->message.choice.c1->present = ASN_RRC_DL_DCCH_MessageType__c1_PR_rrcReconfiguration;
++
++    auto &rrc = pdu->message.choice.c1->choice.rrcReconfiguration = asn::New<ASN_RRC_RRCReconfiguration>();
++    rrc->rrc_TransactionIdentifier = getNextTid();
++    rrc->criticalExtensions.present = ASN_RRC_RRCReconfiguration__criticalExtensions_PR_rrcReconfiguration;
++    rrc->criticalExtensions.choice.rrcReconfiguration = asn::New<ASN_RRC_RRCReconfiguration_IEs>();
++
++    // UERANSIM simulates the radio interface: the handover command payload generated by the target
++    // gNB (from the target-to-source transparent container) is carried in the otherwise unused
++    // secondaryCellGroup field of the RRC Reconfiguration.
++    auto &ies = rrc->criticalExtensions.choice.rrcReconfiguration;
++    ies->secondaryCellGroup = asn::New<OCTET_STRING_t>();
++    asn::SetOctetString(*ies->secondaryCellGroup, rrcContainer);
++
++    m_logger->info("N2 handover: sending RRC Reconfiguration (handover command) to UE[%d]", ueId);
++    sendRrcMessage(ueId, pdu);
++    asn::Free(asn_DEF_ASN_RRC_DL_DCCH_Message, pdu);
++}
++
++void GnbRrcTask::receiveRrcHandoverConfirm(int ueId, const ASN_RRC_RRCReconfigurationComplete &msg)
++{
++    // The UE arrives on this gNB already in RRC_CONNECTED state, so there is no RRC Setup
++    // procedure: the UE context is created here if it does not exist yet.
++    if (tryFindUe(ueId) == nullptr)
++        createUe(ueId);
++
++    auto w = std::make_unique<NmGnbRrcToNgap>(NmGnbRrcToNgap::HANDOVER_CONFIRM);
++    w->ueId = ueId;
++    w->sti = m_ueSti.count(ueId) != 0 ? m_ueSti[ueId] : 0;
++    m_base->ngapTask->push(std::move(w));
++
++    m_logger->info("N2 handover: handover confirm (RRC Reconfiguration Complete) received from UE[%d]", ueId);
++}
++
++} // namespace nr::gnb
+diff --git a/src/gnb/rrc/sap.cpp b/src/gnb/rrc/sap.cpp
+index d6fb019..74c47c6 100644
+--- a/src/gnb/rrc/sap.cpp
++++ b/src/gnb/rrc/sap.cpp
+@@ -19,11 +19,15 @@ void GnbRrcTask::handleRlsSapMessage(NmGnbRlsToRrc &msg)
+     switch (msg.present)
+     {
+     case NmGnbRlsToRrc::SIGNAL_DETECTED: {
++        if (msg.sti != 0)
++            m_ueSti[msg.ueId] = msg.sti;
+         m_logger->debug("UE[%d] new signal detected", msg.ueId);
+         triggerSysInfoBroadcast();
+         break;
+     }
+     case NmGnbRlsToRrc::UPLINK_RRC: {
++        if (msg.sti != 0)
++            m_ueSti[msg.ueId] = msg.sti;
+         handleUplinkRrc(msg.ueId, msg.rrcChannel, msg.data);
+         break;
+     }
+diff --git a/src/gnb/rrc/task.cpp b/src/gnb/rrc/task.cpp
+index 1250cea..37b9b8c 100644
+--- a/src/gnb/rrc/task.cpp
++++ b/src/gnb/rrc/task.cpp
+@@ -69,6 +69,10 @@ void GnbRrcTask::onLoop()
+         case NmGnbNgapToRrc::PAGING:
+             handlePaging(w.uePagingTmsi, w.taiListForPaging);
+             break;
++        case NmGnbNgapToRrc::HANDOVER: {
++            handleHandoverCommand(w.ueId, w.rrcContainer);
++            break;
++        }
+         }
+         break;
+     }
+diff --git a/src/gnb/rrc/task.hpp b/src/gnb/rrc/task.hpp
+index 9da8eb3..ce33c79 100644
+--- a/src/gnb/rrc/task.hpp
++++ b/src/gnb/rrc/task.hpp
+@@ -30,6 +30,7 @@ extern "C"
+ 
+     struct ASN_RRC_RRCSetupRequest;
+     struct ASN_RRC_RRCSetupComplete;
++    struct ASN_RRC_RRCReconfigurationComplete;
+     struct ASN_RRC_ULInformationTransfer;
+ }
+ 
+@@ -48,6 +49,9 @@ class GnbRrcTask : public NtsTask
+     std::unordered_map<int, RrcUeContext *> m_ueCtx;
+     int m_tidCounter;
+ 
++    /* Simulated radio identity (RLS STI) of the UEs, used for the N2 handover procedure */
++    std::unordered_map<int, uint64_t> m_ueSti{};
++
+     bool m_isBarred = true;
+     bool m_cellReserved = false;
+     UacAiBarringSet m_aiBarringSet = {};
+@@ -79,6 +83,10 @@ class GnbRrcTask : public NtsTask
+ 
+     void receiveUplinkInformationTransfer(int ueId, const ASN_RRC_ULInformationTransfer &msg);
+ 
++    /* N2 handover */
++    void handleHandoverCommand(int ueId, const OctetString &rrcContainer);
++    void receiveRrcHandoverConfirm(int ueId, const ASN_RRC_RRCReconfigurationComplete &msg);
++
+     /* RRC channel send message */
+     void sendRrcMessage(ASN_RRC_BCCH_BCH_Message *msg);
+     void sendRrcMessage(ASN_RRC_BCCH_DL_SCH_Message *msg);
+diff --git a/src/gnb/types.hpp b/src/gnb/types.hpp
+index 042adb8..6a8eb78 100644
+--- a/src/gnb/types.hpp
++++ b/src/gnb/types.hpp
+@@ -135,6 +135,7 @@ struct NgapUeContext
+     int downlinkStream{};
+     AggregateMaximumBitRate ueAmbr{};
+     std::set<int> pduSessions{};
++    uint64_t sti{}; // simulated radio identity (RLS STI) of the UE
+ 
+     explicit NgapUeContext(int ctxId) : ctxId(ctxId)
+     {
+@@ -149,6 +150,7 @@ struct RrcUeContext
+     bool isInitialIdSTmsi{}; // TMSI-part-1 or a random value
+     int64_t establishmentCause{};
+     std::optional<GutiMobileIdentity> sTmsi{};
++    uint64_t sti{}; // simulated radio identity (RLS STI) of the UE
+ 
+     explicit RrcUeContext(const int ueId) : ueId(ueId)
+     {
+diff --git a/src/lib/app/cli_cmd.cpp b/src/lib/app/cli_cmd.cpp
+index ca6325e..4005171 100644
+--- a/src/lib/app/cli_cmd.cpp
++++ b/src/lib/app/cli_cmd.cpp
+@@ -152,6 +152,7 @@ static OrderedMap<std::string, CmdEntry> g_gnbCmdEntries = {
+     {"ue-list", {"List all UEs associated with the gNB", "", DefaultDesc, false}},
+     {"ue-count", {"Print the total number of UEs connected the this gNB", "", DefaultDesc, false}},
+     {"ue-release", {"Request a UE context release for the given UE", "<ue-id>", DefaultDesc, false}},
++    {"handover", {"Trigger an N2 handover for the given UE towards the given target gNB", "<ue-id> <target-gnb-id>", DefaultDesc, false}},
+ };
+ 
+ static OrderedMap<std::string, CmdEntry> g_ueCmdEntries = {
+@@ -216,6 +217,19 @@ static std::unique_ptr<GnbCliCommand> GnbCliParseImpl(const std::string &subCmd,
+             CMD_ERR("Invalid UE ID")
+         return cmd;
+     }
++    else if (subCmd == "handover")
++    {
++        auto cmd = std::make_unique<GnbCliCommand>(GnbCliCommand::HANDOVER);
++        if (options.positionalCount() != 2)
++            CMD_ERR("UE ID and target gNB ID are expected")
++        cmd->ueId = utils::ParseInt(options.getPositional(0));
++        cmd->gnbId = utils::ParseInt(options.getPositional(1));
++        if (cmd->ueId <= 0)
++            CMD_ERR("Invalid UE ID")
++        if (cmd->gnbId <= 0)
++            CMD_ERR("Invalid target gNB ID")
++        return cmd;
++    }
+ 
+     return nullptr;
+ }
+diff --git a/src/lib/app/cli_cmd.hpp b/src/lib/app/cli_cmd.hpp
+index fa29239..45aae7d 100644
+--- a/src/lib/app/cli_cmd.hpp
++++ b/src/lib/app/cli_cmd.hpp
+@@ -29,6 +29,7 @@ struct GnbCliCommand
+         UE_LIST,
+         UE_COUNT,
+         UE_RELEASE_REQ,
++        HANDOVER,
+     } present;
+ 
+     // AMF_INFO
+@@ -37,6 +38,9 @@ struct GnbCliCommand
+     // UE_RELEASE_REQ
+     int ueId{};
+ 
++    // HANDOVER
++    int gnbId{};
++
+     explicit GnbCliCommand(PR present) : present(present)
+     {
+     }
+diff --git a/src/lib/ho/ho.cpp b/src/lib/ho/ho.cpp
+new file mode 100644
+index 0000000..8fabeb1
+--- /dev/null
++++ b/src/lib/ho/ho.cpp
+@@ -0,0 +1,82 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#include "ho.hpp"
++
++namespace ho
++{
++
++static OctetString EncodeU64WithMarker(uint8_t marker, uint64_t value)
++{
++    OctetString out;
++    out.appendOctet(marker);
++    out.appendOctet8(value);
++    return out;
++}
++
++OctetString EncodeSourceInfo(const SourceInfo &info)
++{
++    return EncodeU64WithMarker(MARKER_SOURCE_INFO, info.ueSti);
++}
++
++std::optional<SourceInfo> DecodeSourceInfo(const OctetString &data)
++{
++    if (data.length() != 9 || data.getI(0) != MARKER_SOURCE_INFO)
++        return std::nullopt;
++
++    SourceInfo info{};
++    info.ueSti = data.get8UL(1);
++    return info;
++}
++
++OctetString EncodeCommandInfo(const CommandInfo &info)
++{
++    if (info.targetNci > 0xFFFFFFFFFULL)
++        return OctetString{};
++
++    OctetString out;
++    out.appendOctet(MARKER_COMMAND_INFO);
++    for (int i = 0; i < 5; i++)
++        out.appendOctet(static_cast<uint8_t>((info.targetNci >> (8 * (4 - i))) & 0xFF));
++    return out;
++}
++
++std::optional<CommandInfo> DecodeCommandInfo(const OctetString &data)
++{
++    if (data.length() != 6 || data.getI(0) != MARKER_COMMAND_INFO)
++        return std::nullopt;
++
++    // The NR Cell Identity is 36 bits, so the upper 4 bits of the first octet must be zero
++    if (data.getI(1) > 0x0F)
++        return std::nullopt;
++
++    uint64_t nci = 0;
++    for (int i = 0; i < 5; i++)
++        nci = (nci << 8) | static_cast<uint64_t>(data.getI(1 + i));
++
++    CommandInfo info{};
++    info.targetNci = nci;
++    return info;
++}
++
++bool IsBetterCell(int dbmNew, uint64_t nciNew, int dbmRef, uint64_t nciRef)
++{
++    if (dbmNew != dbmRef)
++        return dbmNew > dbmRef;
++    return nciNew < nciRef;
++}
++
++std::optional<int> FindCellByNci(const std::vector<std::pair<int, uint64_t>> &cells, uint64_t nci)
++{
++    for (auto &cell : cells)
++        if (cell.second == nci)
++            return cell.first;
++    return std::nullopt;
++}
++
++} // namespace ho
+diff --git a/src/lib/ho/ho.hpp b/src/lib/ho/ho.hpp
+new file mode 100644
+index 0000000..40fda71
+--- /dev/null
++++ b/src/lib/ho/ho.hpp
+@@ -0,0 +1,58 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include <utils/octet_string.hpp>
++
++// Simulation-defined payloads and helpers for the N2 handover feature.
++//
++// UERANSIM simulates the radio interface internally, therefore the RRC containers that are
++// carried transparently over NGAP (Source-To-Target / Target-To-Source) are filled with the
++// simulation-defined structures below instead of real ASN.1 RRC PDUs. The NGAP envelope,
++// message flow and procedure states remain standard.
++namespace ho
++{
++
++// Simulation container markers (first octet of the payload)
++constexpr uint8_t MARKER_SOURCE_INFO = 0xA1;
++constexpr uint8_t MARKER_COMMAND_INFO = 0xA2;
++
++// Carried in the Source-To-Target Transparent Container (source gNB -> target gNB).
++// Identifies the simulated UE across gNBs (RLS STI: the stable "over-the-air" identity).
++struct SourceInfo
++{
++    uint64_t ueSti{};
++};
++
++// Carried in the Target-To-Source Transparent Container (target gNB -> source gNB) and then
++// forwarded to the UE inside the RRC Reconfiguration (i.e. the simulated handover command).
++struct CommandInfo
++{
++    uint64_t targetNci{}; // 36-bit NR Cell Identity of the target cell
++};
++
++OctetString EncodeSourceInfo(const SourceInfo &info);
++std::optional<SourceInfo> DecodeSourceInfo(const OctetString &data);
++
++OctetString EncodeCommandInfo(const CommandInfo &info);
++std::optional<CommandInfo> DecodeCommandInfo(const OctetString &data);
++
++// Cell ranking used by cell selection: higher signal strength wins, and ties are broken by the
++// lower NCI so that cell selection is deterministic (important for repeatable simulations).
++bool IsBetterCell(int dbmNew, uint64_t nciNew, int dbmRef, uint64_t nciRef);
++
++// Finds the (local) cell id of the cell with the given NCI among the described cells.
++std::optional<int> FindCellByNci(const std::vector<std::pair<int, uint64_t>> &cells, uint64_t nci);
++
++} // namespace ho
+diff --git a/src/ue/nas/mm/mm.hpp b/src/ue/nas/mm/mm.hpp
+index a1de095..6c06e98 100644
+--- a/src/ue/nas/mm/mm.hpp
++++ b/src/ue/nas/mm/mm.hpp
+@@ -204,6 +204,9 @@ class NasMm
+   private: /* Service Access Point */
+     void handleRrcEvent(const NmUeRrcToNas &msg);
+     void handleNasEvent(const NmUeNasToNas &msg);
++
++  private: /* N2 handover (simulation) */
++    void handleRrcHandoverCommand(const Tai &previousTai);
+ };
+ 
+ } // namespace nr::ue
+\ No newline at end of file
+diff --git a/src/ue/nas/mm/radio.cpp b/src/ue/nas/mm/radio.cpp
+index 6cf9b8b..daebd34 100644
+--- a/src/ue/nas/mm/radio.cpp
++++ b/src/ue/nas/mm/radio.cpp
+@@ -214,6 +214,35 @@ void NasMm::handleRrcConnectionRelease()
+     switchCmState(ECmState::CM_IDLE);
+ }
+ 
++void NasMm::handleRrcHandoverCommand(const Tai &previousTai)
++{
++    if (m_mmState == EMmState::MM_NULL)
++        return;
++
++    auto currentCell = m_base->shCtx.currentCell.get();
++    if (!currentCell.hasValue())
++    {
++        m_logger->err("N2 handover: handover completed without a serving cell");
++        return;
++    }
++
++    Tai currentTai{currentCell.plmn, currentCell.tac};
++    if (currentTai == previousTai)
++    {
++        m_logger->debug("N2 handover: tracking area unchanged, no mobility registration update required");
++        return;
++    }
++
++    // TS 23.502 4.9.1.3.3 step 12: after the handover the UE performs a mobility registration
++    // update (a subset of the registration procedure) when the tracking area has changed.
++    if (m_mmState == EMmState::MM_REGISTERED && currentCell.category == ECellCategory::SUITABLE_CELL)
++    {
++        m_logger->info("N2 handover: tracking area changed after the handover, initiating a mobility registration "
++                       "update");
++        mobilityUpdatingRequired(ERegUpdateCause::ENTER_UNLISTED_TRACKING_AREA);
++    }
++}
++
+ void NasMm::handleRrcEstablishmentFailure()
+ {
+     m_logger->err("RRC Establishment failure");
+diff --git a/src/ue/nas/mm/sap.cpp b/src/ue/nas/mm/sap.cpp
+index 67ecb1e..04361db 100644
+--- a/src/ue/nas/mm/sap.cpp
++++ b/src/ue/nas/mm/sap.cpp
+@@ -40,6 +40,10 @@ void NasMm::handleRrcEvent(const NmUeRrcToNas &msg)
+         handleRrcConnectionRelease();
+         break;
+     }
++    case NmUeRrcToNas::RRC_HANDOVER_COMMAND: {
++        handleRrcHandoverCommand(msg.previousTai);
++        break;
++    }
+     case NmUeRrcToNas::RADIO_LINK_FAILURE: {
+         handleRadioLinkFailure();
+         break;
+diff --git a/src/ue/nts.hpp b/src/ue/nts.hpp
+index 713ea2e..462f4be 100644
+--- a/src/ue/nts.hpp
++++ b/src/ue/nts.hpp
+@@ -68,6 +68,7 @@ struct NmUeRrcToNas : NtsMessage
+         NAS_DELIVERY,
+         RRC_CONNECTION_SETUP,
+         RRC_CONNECTION_RELEASE,
++        RRC_HANDOVER_COMMAND,
+         RRC_ESTABLISHMENT_FAILURE,
+         RADIO_LINK_FAILURE,
+         PAGING,
+@@ -141,6 +142,7 @@ struct NmUeRrcToRrc : NtsMessage
+     enum PR
+     {
+         TRIGGER_CYCLE,
++        HANDOVER_CONFIRM,
+     } present;
+ 
+     explicit NmUeRrcToRrc(PR present) : NtsMessage(NtsMessageType::UE_RRC_TO_RRC), present(present)
+diff --git a/src/ue/rrc/channel.cpp b/src/ue/rrc/channel.cpp
+index 54b5553..2dde9c0 100644
+--- a/src/ue/rrc/channel.cpp
++++ b/src/ue/rrc/channel.cpp
+@@ -187,6 +187,9 @@ void UeRrcTask::receiveRrcMessage(ASN_RRC_DL_DCCH_Message *msg)
+     case ASN_RRC_DL_DCCH_MessageType__c1_PR_rrcRelease:
+         receiveRrcRelease(*c1->choice.rrcRelease);
+         break;
++    case ASN_RRC_DL_DCCH_MessageType__c1_PR_rrcReconfiguration:
++        receiveRrcReconfiguration(*c1->choice.rrcReconfiguration);
++        break;
+     default:
+         break;
+     }
+diff --git a/src/ue/rrc/handover.cpp b/src/ue/rrc/handover.cpp
+new file mode 100644
+index 0000000..1df9797
+--- /dev/null
++++ b/src/ue/rrc/handover.cpp
+@@ -0,0 +1,198 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++// UE side RRC handling of the N2 handover simulation.
++//
++// The handover command arrives inside an RRC Reconfiguration message (the payload is generated by
++// the target gNB and transported transparently over NGAP). The UE resolves the target cell by its
++// NCI, assigns it as the serving cell and confirms the reconfiguration to the target gNB.
++
++#include "task.hpp"
++
++#include <algorithm>
++
++#include <lib/ho/ho.hpp>
++#include <lib/rrc/encode.hpp>
++#include <ue/nas/task.hpp>
++#include <ue/rls/task.hpp>
++
++#include <asn/rrc/ASN_RRC_RRCReconfiguration-IEs.h>
++#include <asn/rrc/ASN_RRC_RRCReconfiguration.h>
++#include <asn/rrc/ASN_RRC_RRCReconfigurationComplete-IEs.h>
++#include <asn/rrc/ASN_RRC_RRCReconfigurationComplete.h>
++#include <asn/rrc/ASN_RRC_UL-DCCH-Message.h>
++
++namespace nr::ue
++{
++
++bool UeRrcTask::isSuitableCell(const UeCellDesc &cell)
++{
++    Plmn selectedPlmn = m_base->shCtx.selectedPlmn.get();
++    Tai tai{cell.sib1.plmn, cell.sib1.tac};
++
++    if (!cell.sib1.hasSib1 || !cell.mib.hasMib || cell.sib1.plmn != selectedPlmn || cell.mib.isBarred ||
++        cell.sib1.isReserved)
++        return false;
++
++    if (m_base->shCtx.forbiddenTaiRoaming.get<bool>([&tai](auto &item) {
++            return std::any_of(item.begin(), item.end(), [&tai](auto &element) { return element == tai; });
++        }))
++        return false;
++
++    if (m_base->shCtx.forbiddenTaiRps.get<bool>([&tai](auto &item) {
++            return std::any_of(item.begin(), item.end(), [&tai](auto &element) { return element == tai; });
++        }))
++        return false;
++
++    return true;
++}
++
++bool UeRrcTask::isAcceptableCell(const UeCellDesc &cell)
++{
++    Tai tai{cell.sib1.plmn, cell.sib1.tac};
++
++    if (!cell.sib1.hasSib1 || !cell.mib.hasMib || cell.mib.isBarred || cell.sib1.isReserved)
++        return false;
++
++    if (m_base->shCtx.forbiddenTaiRoaming.get<bool>([&tai](auto &item) {
++            return std::any_of(item.begin(), item.end(), [&tai](auto &element) { return element == tai; });
++        }))
++        return false;
++
++    if (m_base->shCtx.forbiddenTaiRps.get<bool>([&tai](auto &item) {
++            return std::any_of(item.begin(), item.end(), [&tai](auto &element) { return element == tai; });
++        }))
++        return false;
++
++    return true;
++}
++
++void UeRrcTask::receiveRrcReconfiguration(const ASN_RRC_RRCReconfiguration &msg)
++{
++    m_logger->debug("RRC Reconfiguration received");
++
++    if (msg.criticalExtensions.present != ASN_RRC_RRCReconfiguration__criticalExtensions_PR_rrcReconfiguration)
++        return;
++
++    auto *ies = msg.criticalExtensions.choice.rrcReconfiguration;
++    if (ies == nullptr || ies->secondaryCellGroup == nullptr)
++    {
++        m_logger->err("N2 handover: RRC Reconfiguration without a handover command payload, ignoring");
++        return;
++    }
++
++    auto command = ho::DecodeCommandInfo(asn::GetOctetString(*ies->secondaryCellGroup));
++    if (!command.has_value())
++    {
++        m_logger->err("N2 handover: invalid handover command payload, ignoring");
++        return;
++    }
++
++    // Resolve the target cell among the cells in coverage (the NCI is learned from SIB1)
++    std::vector<std::pair<int, uint64_t>> cells;
++    for (auto &item : m_cellDesc)
++        if (item.second.sib1.hasSib1)
++            cells.emplace_back(item.first, static_cast<uint64_t>(item.second.sib1.nci));
++
++    auto targetCellId = ho::FindCellByNci(cells, command->targetNci);
++    if (!targetCellId.has_value())
++    {
++        m_logger->err("N2 handover: target cell (nci[%llu]) is not in coverage, cannot perform the handover",
++                      (unsigned long long)command->targetNci);
++        return;
++    }
++
++    Tai previousTai;
++    {
++        auto previousCell = m_base->shCtx.currentCell.get();
++        previousTai = Tai{previousCell.plmn, previousCell.tac};
++    }
++
++    m_lastTid = msg.rrc_TransactionIdentifier;
++
++    if (!performCellChange(targetCellId.value()))
++        return;
++
++    // TS 38.331: the UE confirms the reconfiguration to the target cell
++    sendHandoverConfirmMessage();
++
++    // TS 23.502 4.9.1.3.3 step 12: the UE performs a mobility registration update if needed
++    auto w = std::make_unique<NmUeRrcToNas>(NmUeRrcToNas::RRC_HANDOVER_COMMAND);
++    w->previousTai = previousTai;
++    m_base->nasTask->push(std::move(w));
++}
++
++bool UeRrcTask::performCellChange(int newCellId)
++{
++    auto previousCell = m_base->shCtx.currentCell.get();
++
++    if (newCellId == 0)
++    {
++        m_logger->err("N2 handover: cannot change the serving cell, the new cell id is 0");
++        return false;
++    }
++    if (previousCell.cellId == newCellId)
++    {
++        m_logger->warn("N2 handover: the target cell[%d] is already the serving cell", newCellId);
++        return false;
++    }
++    if (m_cellDesc.count(newCellId) == 0)
++    {
++        m_logger->err("N2 handover: cannot change to cell[%d], no cell description available", newCellId);
++        return false;
++    }
++
++    auto &desc = m_cellDesc[newCellId];
++
++    ActiveCellInfo cellInfo{};
++    cellInfo.cellId = newCellId;
++    cellInfo.plmn = desc.sib1.plmn;
++    cellInfo.tac = desc.sib1.tac;
++
++    if (isSuitableCell(desc))
++        cellInfo.category = ECellCategory::SUITABLE_CELL;
++    else if (isAcceptableCell(desc))
++        cellInfo.category = ECellCategory::ACCEPTABLE_CELL;
++    else
++    {
++        m_logger->err("N2 handover: cannot change to cell[%d], the cell is neither suitable nor acceptable", newCellId);
++        return false;
++    }
++
++    m_base->shCtx.currentCell.set(cellInfo);
++    m_logger->info("N2 handover: serving cell changed from cell[%d] to cell[%d] (plmn[%s] tac[%d])",
++                   previousCell.cellId, newCellId, ToJson(cellInfo.plmn).str().c_str(), cellInfo.tac);
++
++    auto w = std::make_unique<NmUeRrcToRls>(NmUeRrcToRls::ASSIGN_CURRENT_CELL);
++    w->cellId = newCellId;
++    m_base->rlsTask->push(std::move(w));
++
++    return true;
++}
++
++void UeRrcTask::sendHandoverConfirmMessage()
++{
++    auto *pdu = asn::New<ASN_RRC_UL_DCCH_Message>();
++    pdu->message.present = ASN_RRC_UL_DCCH_MessageType_PR_c1;
++    pdu->message.choice.c1 = asn::NewFor(pdu->message.choice.c1);
++    pdu->message.choice.c1->present = ASN_RRC_UL_DCCH_MessageType__c1_PR_rrcReconfigurationComplete;
++
++    auto &complete = pdu->message.choice.c1->choice.rrcReconfigurationComplete =
++        asn::New<ASN_RRC_RRCReconfigurationComplete>();
++    complete->rrc_TransactionIdentifier = m_lastTid;
++    complete->criticalExtensions.present =
++        ASN_RRC_RRCReconfigurationComplete__criticalExtensions_PR_rrcReconfigurationComplete;
++    complete->criticalExtensions.choice.rrcReconfigurationComplete =
++        asn::New<ASN_RRC_RRCReconfigurationComplete_IEs>();
++
++    m_logger->info("N2 handover: sending RRC Reconfiguration Complete to the target cell");
++    sendRrcMessage(pdu);
++    asn::Free(asn_DEF_ASN_RRC_UL_DCCH_Message, pdu);
++}
++
++} // namespace nr::ue
+diff --git a/src/ue/rrc/idle.cpp b/src/ue/rrc/idle.cpp
+index 5628933..75823be 100644
+--- a/src/ue/rrc/idle.cpp
++++ b/src/ue/rrc/idle.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ 
++#include <lib/ho/ho.hpp>
+ #include <lib/rrc/encode.hpp>
+ #include <ue/nas/task.hpp>
+ #include <ue/rls/task.hpp>
+@@ -177,11 +178,13 @@ bool UeRrcTask::lookForSuitableCell(ActiveCellInfo &cellInfo, CellSelectionRepor
+     if (candidates.empty())
+         return false;
+ 
+-    // Order candidates by signal strength
++    // Order candidates by signal strength. Ties are broken by the lower NCI so that cell
++    // selection is deterministic (important for repeatable handover simulations).
+     std::sort(candidates.begin(), candidates.end(), [this](int a, int b) {
+         auto &cellA = m_cellDesc[a];
+         auto &cellB = m_cellDesc[b];
+-        return cellB.dbm < cellA.dbm;
++        return ho::IsBetterCell(cellA.dbm, static_cast<uint64_t>(cellA.sib1.nci), cellB.dbm,
++                                static_cast<uint64_t>(cellB.sib1.nci));
+     });
+ 
+     auto &selectedId = candidates[0];
+@@ -253,11 +256,12 @@ bool UeRrcTask::lookForAcceptableCell(ActiveCellInfo &cellInfo, CellSelectionRep
+     if (candidates.empty())
+         return false;
+ 
+-    // Order candidates by signal strength first
++    // Order candidates by signal strength first (ties are broken by the lower NCI)
+     std::sort(candidates.begin(), candidates.end(), [this](int a, int b) {
+         auto &cellA = m_cellDesc[a];
+         auto &cellB = m_cellDesc[b];
+-        return cellB.dbm < cellA.dbm;
++        return ho::IsBetterCell(cellA.dbm, static_cast<uint64_t>(cellA.sib1.nci), cellB.dbm,
++                                static_cast<uint64_t>(cellB.sib1.nci));
+     });
+ 
+     // Then order candidates by PLMN priority if we have a selected PLMN
+diff --git a/src/ue/rrc/task.cpp b/src/ue/rrc/task.cpp
+index fc14a94..06215b6 100644
+--- a/src/ue/rrc/task.cpp
++++ b/src/ue/rrc/task.cpp
+@@ -67,6 +67,9 @@ void UeRrcTask::onLoop()
+         case NmUeRrcToRrc::TRIGGER_CYCLE:
+             performCycle();
+             break;
++        case NmUeRrcToRrc::HANDOVER_CONFIRM:
++            sendHandoverConfirmMessage();
++            break;
+         }
+         break;
+     }
+diff --git a/src/ue/rrc/task.hpp b/src/ue/rrc/task.hpp
+index 33f91a7..9f54535 100644
+--- a/src/ue/rrc/task.hpp
++++ b/src/ue/rrc/task.hpp
+@@ -40,6 +40,7 @@ extern "C"
+     struct ASN_RRC_Paging;
+     struct ASN_RRC_MIB;
+     struct ASN_RRC_SIB1;
++    struct ASN_RRC_RRCReconfiguration;
+ }
+ 
+ namespace nr::ue
+@@ -59,6 +60,9 @@ class UeRrcTask : public NtsTask
+     std::unordered_map<int, UeCellDesc> m_cellDesc{};
+     int64_t m_lastTimePlmnSearchFailureLogged{};
+ 
++    /* Handover related */
++    int64_t m_lastTid{0};
++
+     /* Procedure related */
+     ERrcLastSetupRequest m_lastSetupReq{};
+ 
+@@ -137,6 +141,13 @@ class UeRrcTask : public NtsTask
+ 
+     /* Access Control */
+     void performUac(std::shared_ptr<LightSync<UacInput, UacOutput>> &uacCtl);
++
++    /* N2 handover (simulation) */
++    void receiveRrcReconfiguration(const ASN_RRC_RRCReconfiguration &msg);
++    bool performCellChange(int newCellId);
++    bool isSuitableCell(const UeCellDesc &cell);
++    bool isAcceptableCell(const UeCellDesc &cell);
++    void sendHandoverConfirmMessage();
+ };
+ 
+ } // namespace nr::ue
+diff --git a/tests/handover/CMakeLists.txt b/tests/handover/CMakeLists.txt
+new file mode 100644
+index 0000000..0ae7df6
+--- /dev/null
++++ b/tests/handover/CMakeLists.txt
+@@ -0,0 +1,16 @@
++# N2 handover unit tests (self-contained, no external test framework).
++#
++# The test lives in its own subdirectory so that this delivery can coexist with other test
++# suites (e.g. the IMS delivery) that also extend the tests/ directory.
++
++add_executable(ho-tests
++  ho_tests.cpp
++  ../../src/lib/ho/ho.cpp
++  ../../src/utils/octet_string.cpp
++  ../../src/utils/common.cpp
++)
++
++target_include_directories(ho-tests PRIVATE ../../src)
++target_compile_options(ho-tests PRIVATE -Wall -Wextra)
++
++add_test(NAME ho-tests COMMAND ho-tests)
+diff --git a/tests/handover/ho_tests.cpp b/tests/handover/ho_tests.cpp
+new file mode 100644
+index 0000000..638a731
+--- /dev/null
++++ b/tests/handover/ho_tests.cpp
+@@ -0,0 +1,110 @@
++// Plain-assert unit tests for the N2 handover pure functions.
++//
++// Covers the simulation container codec (lib/ho) and the deterministic cell ranking used by
++// cell selection. No external test framework is used.
++
++#include <cstdint>
++#include <cstdio>
++#include <utility>
++#include <vector>
++
++#include <lib/ho/ho.hpp>
++
++static int g_failures = 0;
++
++#define CHECK(cond, name)                                                                                              \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        if (!(cond))                                                                                                   \
++        {                                                                                                              \
++            std::printf("[FAIL] %s\n", name);                                                                          \
++            g_failures++;                                                                                              \
++        }                                                                                                              \
++        else                                                                                                           \
++        {                                                                                                              \
++            std::printf("[ OK ] %s\n", name);                                                                          \
++        }                                                                                                              \
++    } while (0)
++
++int main()
++{
++    using namespace ho;
++
++    // ---------- SourceInfo codec ----------
++    {
++        SourceInfo info{};
++        info.ueSti = 0x1122334455667788ULL;
++        auto encoded = EncodeSourceInfo(info);
++        CHECK(encoded.length() == 9, "source info encoded length is 9");
++
++        auto decoded = DecodeSourceInfo(encoded);
++        CHECK(decoded.has_value() && decoded->ueSti == info.ueSti, "source info round trip");
++    }
++    {
++        OctetString wrongMarker;
++        wrongMarker.appendOctet(MARKER_COMMAND_INFO);
++        wrongMarker.appendOctet8(uint64_t{1});
++        CHECK(!DecodeSourceInfo(wrongMarker).has_value(), "source info rejects wrong marker");
++
++        OctetString truncated;
++        truncated.appendOctet(MARKER_SOURCE_INFO);
++        CHECK(!DecodeSourceInfo(truncated).has_value(), "source info rejects truncated input");
++
++        CHECK(!DecodeSourceInfo(OctetString{}).has_value(), "source info rejects empty input");
++    }
++
++    // ---------- CommandInfo codec ----------
++    {
++        const uint64_t ncis[] = {0ULL, 1ULL, 0x10ULL, 0xABCDEF123ULL, 0xFFFFFFFFFULL};
++        bool allOk = true;
++        for (uint64_t nci : ncis)
++        {
++            CommandInfo info{};
++            info.targetNci = nci;
++            auto encoded = EncodeCommandInfo(info);
++            auto decoded = DecodeCommandInfo(encoded);
++            allOk = allOk && decoded.has_value() && decoded->targetNci == nci;
++        }
++        CHECK(allOk, "command info round trip for boundary NCIs");
++    }
++    {
++        CommandInfo overflow{};
++        overflow.targetNci = 0x1000000000ULL; // 37 bits
++        CHECK(EncodeCommandInfo(overflow).length() == 0, "command info rejects NCI larger than 36 bits on encode");
++    }
++    {
++        OctetString badRange;
++        badRange.appendOctet(MARKER_COMMAND_INFO);
++        badRange.appendOctet(0x10); // upper 4 bits must be zero for a 36-bit NCI
++        badRange.appendOctet(0);
++        badRange.appendOctet(0);
++        badRange.appendOctet(0);
++        badRange.appendOctet(0);
++        CHECK(!DecodeCommandInfo(badRange).has_value(), "command info enforces the 36-bit NCI range on decode");
++    }
++
++    // ---------- Deterministic cell ranking ----------
++    {
++        CHECK(IsBetterCell(-50, 0x20, -60, 0x10), "stronger signal wins regardless of NCI");
++        CHECK(!IsBetterCell(-60, 0x10, -50, 0x20), "weaker signal loses regardless of NCI");
++        CHECK(IsBetterCell(-50, 0x10, -50, 0x20), "equal signal prefers the lower NCI");
++        CHECK(!IsBetterCell(-50, 0x20, -50, 0x10), "equal signal rejects the higher NCI");
++    }
++
++    // ---------- Target cell resolution ----------
++    {
++        std::vector<std::pair<int, uint64_t>> cells{{1, 0x10}, {2, 0x20}, {3, 0x30}};
++        auto found = FindCellByNci(cells, 0x20);
++        CHECK(found.has_value() && found.value() == 2, "target cell resolved by NCI");
++        CHECK(!FindCellByNci(cells, 0x40).has_value(), "unknown NCI is not resolved");
++    }
++
++    if (g_failures == 0)
++    {
++        std::printf("All N2 handover tests passed.\n");
++        return 0;
++    }
++
++    std::printf("%d N2 handover test(s) failed.\n", g_failures);
++    return 1;
++}

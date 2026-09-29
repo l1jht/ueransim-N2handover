@@ -1,0 +1,32 @@
+# gNB1（源 gNB）配置模板
+# 注意：链路参数（linkIp/ngapIp/gtpIp）与 AMF 地址需按实际拓扑修改。
+# 本模板默认对应 free5GC docker compose（privnet 10.100.200.0/24）：
+#   - gnb1 静态地址 10.100.200.101
+#   - AMF 别名     amf.free5gc.org （或直接写 10.100.200.16）
+# Open5GS/本机部署：将三个 IP 改为 gNB 本机地址（如 127.0.0.1），AMF 写 127.0.0.1:38412。
+#
+# 两 gNB 的 gNB ID 必须不同；NCI 约定 = gNB ID << (36 - idLength) + 小区号（此处小区号 0）：
+#   gnb1: nci 0x000000010 -> gNB ID 1
+#   gnb2: nci 0x000000020 -> gNB ID 2
+
+mcc: '208'
+mnc: '93'
+
+nci: '0x000000010'   # NR Cell Identity (36-bit)
+idLength: 32         # NR gNB ID length in bits [22...32]
+tac: 1               # 与 gnb2 相同（基础场景：切换后无需注册更新）
+
+linkIp: 10.100.200.101   # RLS（空口模拟）绑定地址
+ngapIp: 10.100.200.101   # N2（SCTP）绑定地址
+gtpIp: 10.100.200.101    # N3（GTP-U）绑定地址
+
+amfConfigs:
+  - address: amf.free5gc.org
+    port: 38412
+
+slices:
+  - sst: 0x1
+    sd: 0x010203
+
+# 建议开启：允许 AMF 在 UE 关联信令中使用任意 SCTP stream
+ignoreStreamIds: true

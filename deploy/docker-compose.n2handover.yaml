@@ -1,0 +1,71 @@
+# N2 handover E2E: two UERANSIM gNBs + one UE attached to the free5GC compose network.
+#
+# Usage (from a free5gc-compose checkout):
+#   # 1) Build UERANSIM v3.3.0 + n2handover.patch, note the build directory
+#   # 2) Edit the UERANSIM_BUILD_DIR path below
+#   # 3) Copy config/gnb1.yaml, gnb2.yaml, ue.yaml into ./config/ (adjust IPs if needed)
+#   # 4) Provision the subscriber (see docs/RUN.md)
+#   # 5) docker compose -f docker-compose.yaml -f docker-compose.n2handover.yaml up -d \
+#            db free5gc-nrf free5gc-amf free5gc-ausf free5gc-udm free5gc-udr free5gc-pcf \
+#            free5gc-nssf free5gc-smf free5gc-chf free5gc-upf free5gc-webui gnb1 gnb2 ue
+#
+# Notes:
+#   - Static addresses are deliberately high in the subnet (10.100.200.101/.102/.121): docker
+#     assigns dynamic addresses from the low end (the free5GC services occupy .2 .. .16).
+#     Keep them distinct from .15/.16/.203 used by the upstream compose.
+#   - linkIp/ngapIp/gtpIp in the gNB configs must equal the addresses assigned here.
+#   - The GTP-U data plane requires the gtp5g kernel module loaded on the host.
+
+services:
+  gnb1:
+    container_name: gnb1
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb1.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/gnb1.yaml:/ueransim/config/gnb1.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.101
+    depends_on:
+      - free5gc-amf
+      - free5gc-upf
+
+  gnb2:
+    container_name: gnb2
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb2.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/gnb2.yaml:/ueransim/config/gnb2.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.102
+    depends_on:
+      - free5gc-amf
+      - free5gc-upf
+
+  ue:
+    container_name: ue
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-ue -c /ueransim/config/ue.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/ue.yaml:/ueransim/config/ue.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun"
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.121
+    depends_on:
+      - gnb1
+      - gnb2

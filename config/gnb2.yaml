@@ -1,0 +1,25 @@
+# gNB2（目标 gNB）配置模板
+# 与 gnb1 的唯一必要差异：nci（gNB ID）与链路 IP。
+# 如需验证"切换后 TAI 变化触发移动性注册更新"，可将本配置 tac 改为 1 以外的值，
+# 并确认 AMF 的 supportTaiList 包含该 TAC。
+
+mcc: '208'
+mnc: '93'
+
+nci: '0x000000020'   # NR Cell Identity (36-bit) -> gNB ID 2
+idLength: 32
+tac: 1
+
+linkIp: 10.100.200.102
+ngapIp: 10.100.200.102
+gtpIp: 10.100.200.102
+
+amfConfigs:
+  - address: amf.free5gc.org
+    port: 38412
+
+slices:
+  - sst: 0x1
+    sd: 0x010203
+
+ignoreStreamIds: true
