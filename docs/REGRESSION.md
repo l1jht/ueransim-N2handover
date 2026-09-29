@@ -70,7 +70,31 @@ docker exec ue ping -I uesimtun0 -c 5 10.100.200.1   # 切换前后数据面
 # 失败路径：启动一个不含 sessions 的 UE 配置，注册后直接触发 handover
 ```
 
-## 5. 结论
+## 5. Open5GS VoNR 验收（含 IMS 通话中切换）
+
+除 free5GC 外，另在 **docker_open5gs（`sa-vonr-deploy.yaml`）** 上完成两项目标验收：
+① **Open5GS 兼容性**；② **IMS 通话中 N2 切换的连续性**（下游任务的验收场景，非补丁功能本身）。
+
+环境：docker_open5gs（Open5GS + Kamailio 6.2.0-dev1 + pyHSS，PLMN 001/01，TAC 1，SST 1）、
+UERANSIM 为 **n2handover + ims 补丁合并构建**；测试床资产、步骤与排错见 `deploy/open5gs/README.md`。
+
+| # | 测试 | 结果 |
+|---|---|---|
+| O1 | 两 UE 接入 + 双 PDU 会话（internet + ims）+ IMS 注册 | ✅ 均成功 |
+| O2 | VoNR 通话建立（UE1→UE2 自动应答，rtpengine 双向 RTP） | ✅ 双方 CONFIRMED |
+| O3 | 通话中切换 UE1（gNB1→gNB2）与回切（gNB2→gNB1） | ✅ 两次均保持 CONFIRMED |
+| O4 | RTP 缺口（75 s 抓包，含两次切换窗口） | ✅ 双向最大 **39.8–40.9 ms**，>60 ms 间隔 **0** |
+| O5 | 事件日志相关性（源/目标同一 `ho_id`，阶段序列完整） | ✅ |
+
+证据摘要：`deploy/open5gs/evidence/ims-handover-summary.txt`；一键脚本：`deploy/open5gs/run-ims-test.sh`。
+
+为在 Open5GS 上跑通 IMS 测试，对 docker_open5gs 应用了 3 处**测试床适配**（I-CSCF 单 S-CSCF 直连、
+P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
+`deploy/open5gs/tweaks/apply-open5gs-tweaks.sh` 幂等应用）。这些适配仅涉及 5GC/IMS 配置，
+**不涉及本补丁代码**；N2 切换在 Open5GS 上的行为与 free5GC 一致（含路径切换后源侧释放、
+目标侧 AMF-UE-NGAP-ID 重新分配的处理）。
+
+## 6. 结论
 
 - 补丁**未引入对既有功能的回归**（含基线对照验证）；
 - N2 切换的正常路径（单 UE / 多 UE / 多 PDU 会话 / 反复切换）与失败路径（Preparation Failure）均按规范行为工作；

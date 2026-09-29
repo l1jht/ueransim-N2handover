@@ -1,0 +1,62 @@
+services:
+  gnb1:
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    container_name: o5gs-gnb1
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb1.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./n2handover/gnb1.yaml:/ueransim/config/gnb1.yaml:ro
+      - ./n2handover/ho-events/gnb1:/ueransim/logs
+    cap_add:
+      - NET_ADMIN
+    networks:
+      default:
+        ipv4_address: 172.22.0.91
+
+  gnb2:
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    container_name: o5gs-gnb2
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb2.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./n2handover/gnb2.yaml:/ueransim/config/gnb2.yaml:ro
+      - ./n2handover/ho-events/gnb2:/ueransim/logs
+    cap_add:
+      - NET_ADMIN
+    networks:
+      default:
+        ipv4_address: 172.22.0.92
+
+  ue1:
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    container_name: o5gs-ue1
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-ue -c /ueransim/config/ue1.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./n2handover/ue1.yaml:/ueransim/config/ue1.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun"
+    networks:
+      default:
+        ipv4_address: 172.22.0.93
+
+  ue2:
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    container_name: o5gs-ue2
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-ue -c /ueransim/config/ue2.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./n2handover/ue2.yaml:/ueransim/config/ue2.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun"
+    networks:
+      default:
+        ipv4_address: 172.22.0.94

@@ -216,3 +216,50 @@ Open5GS 的 UPF 为**用户态**（`ogstun`，无需 gtp5g 内核模块），部
 1. **静态 IP 与 Docker 动态分配冲突**：docker 会从子网低位顺序分配动态地址（核心网容器占用到 `.12` 左右），因此 gNB/UE 的静态地址请使用高位（如 `.101/.102/.121`），否则报 `Address already in use`。
 2. **free5GC WebUI 订阅者 `SmPolicyData` 键格式**：`smPolicySnssaiData` 的键必须是 `sst(两位十六进制)+sd`，即 `sst=1, sd=010203 → "01010203"`；否则 PCF 报 `Can't find UE SM Policy Data in UDR`，PDU 会话建立失败。`deploy/provision-subscriber.sh` 已按此格式提供。
 
+## 10. Open5GS / docker_open5gs VoNR 实测记录（含 IMS 通话中 N2 切换）
+
+> 目的：① 在第二套标准核心网（Open5GS）上验证 N2 handover 兼容性；
+> ② 作为下游 IMS 任务的验收场景，验证**通话中切换**的连续性（U1′：通用能力，无 IMS 专用代码）。
+> 环境：docker_open5gs `sa-vonr-deploy.yaml`（Open5GS + Kamailio/pyHSS IMS，PLMN 001/01，TAC 1，SST 1），
+> UERANSIM 使用 **n2handover + ims 补丁的合并构建**（原生或容器均可）。
+> 完整步骤与资产见 **`deploy/open5gs/README.md`**；本节只记录结果与要点。
+
+### 10.1 测试床关键适配（3 处，脚本 `deploy/open5gs/tweaks/apply-open5gs-tweaks.sh` 幂等应用）
+
+1. **I-CSCF**：单 S-CSCF 直连（`SCSCF_ADDR`），绕过 Kamailio↔pyHSS 的 Diameter LIR/LIA 解析差异；
+2. **P-CSCF**：关闭 `WITH_IPSEC` 与 `listen=tcp`。原因：`IPSEC_FORWARD_TRYTCP` 会对未做 IPSec 的 UE
+   发 TCP（实测源端口 5100）→ 408；且该 Kamailio 6.2.0-dev1 构建在有 TCP 监听时会以 TCP 转发 MT 请求；
+3. **PCF**：`qos_profiles`（`qosVoNR`→5QI 5）与 IMS 会话 `pcc_rule`（否则 N5 授权 403→REGISTER 412）。
+
+以上均为**测试床环境适配**（不改 5GC/IMS 协议行为，也不改本补丁），细节与排错见 `deploy/open5gs/README.md` §4/§6。
+
+### 10.2 结果（2026-09-29）
+
+| 验证项 | 结果 |
+|---|---|
+| UE 接入 + 双 PDU 会话（internet + ims） | ✅ 两 UE 均成功 |
+| IMS 注册（REGISTER 200 OK） | ✅ 两 UE，expires=300 |
+| VoNR 通话建立（UE1→UE2，自动应答） | ✅ 双方 `callState=CONFIRMED`，rtpengine 双向 RTP |
+| N2 切换（UE1：gNB1→gNB2） | ✅ 通话保持 CONFIRMED；事件序列完整 |
+| N2 切换（UE1：gNB2→gNB1 回切） | ✅ 通话保持 CONFIRMED |
+| **RTP 缺口（两次切换窗口内）** | ✅ 双向、两 UE 最大包间隔 **39.8–40.9 ms**，>60 ms 间隔 **0**（75 s 抓包） |
+| 事件日志相关性 | ✅ 每次切换源/目标 gNB 共享同一 `ho_id`，阶段序列完整（见下） |
+
+单次切换事件序列（JSONL，宿主机 `deploy/open5gs/ho-events/<gnb>/`）：
+
+```
+source: HO_REQUIRED_SENT → HO_COMMAND_RECEIVED → RRC_RECFG_SENT → UE_CTX_RELEASE_RECEIVED
+target: HO_REQUEST_RECEIVED → HO_ACK_SENT → RRC_RECFG_COMPLETE_RECEIVED → HO_NOTIFY_SENT
+```
+
+证据摘要：`deploy/open5gs/evidence/ims-handover-summary.txt`（通话状态 + 缺口分析 + 事件相关性）。
+
+### 10.3 测量与复现要点
+
+- **RTP 测量点**：在 **rtpengine 容器的网络命名空间**内抓包（旁路容器），可同时看到两 UE 的上下行；
+  UE 容器内 `tcpdump` 看不到 TUN 上的本机媒体流（AF_PACKET 不覆盖该路径），脚本已内置处理。
+- **一键验收**：`deploy/open5gs/run-ims-test.sh --start`（自动识别 ue-id、建立通话、双向切换、分析与相关性输出）。
+- Open5GS 与 free5GC 的 N2 切换流程（`docs/RUN.md` §5）**完全一致**；本节未发现任何 Open5GS 特有的实现差异
+  （AMF 同样在路径切换后释放源侧、目标侧采用新分配的 AMF-UE-NGAP-ID，本实现按 RAN-UE-NGAP-ID 匹配）。
+
+

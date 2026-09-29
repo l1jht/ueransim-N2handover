@@ -108,9 +108,13 @@ docker exec gnb1 tail -n 20 /ueransim/logs/UERANSIM-gnb-208-93-1.ho-events.jsonl
 
 1. 启动 5GC/IMS 与两个 gNB、两个 UE；两个 UE 完成 `internet`+`ims` 会话与 SIP REGISTER；
 2. `ims-call` 由 ue1 呼叫 ue2（ue2 `autoAnswer` 自动应答）；
-3. 在**两端的 ims 隧道**上抓包（`tcpdump -tt -n -i any 'udp and net <ims子网>'`）；
+3. 在 **rtpengine 容器的网络命名空间**内抓包（旁路容器：`docker run --rm --net=container:rtpengine … tcpdump -n -tt -l -i any 'udp and (host <ue1_ims_ip> or host <ue2_ims_ip>)'`）；
+   注意：在 UE 容器内对 `uesimtunN`/`any` 抓包看不到本机媒体流（该路径不经 AF_PACKET），因此统一在 rtpengine 侧测量；
 4. 触发 ue1 的 N2 切换（`nr-cli handover`），等待流程完成；
 5. 复核两侧 `ims-status`（呼叫是否保持）并分析抓包。
+
+> 交付脚本 `deploy/open5gs/run-ims-test.sh` 已把上述流程（含 ue-id 自动识别、双向切换、缺口分析与
+> ho-events 相关性）自动化，可直接作为验收入口。
 
 ### 3.3 分析口径（可自行调整阈值）
 
@@ -118,4 +122,8 @@ docker exec gnb1 tail -n 20 /ueransim/logs/UERANSIM-gnb-208-93-1.ho-events.jsonl
 - **丢包率**：按序列号（需要 RTP 级别的 seq 解析；本交付给到的是包到达时间线，seq 级分析可结合抓包工具的 RTP 解析）；
 - **方向**：按源/目的地址区分 UL/DL，分别统计（DL 中断窗口在切换前后由 5GC 路径切换决定）。
 
-> 本交付的切换实现**不包含 gNB 间数据转发**，因此 DL 在"UE 迁移 → 5GC 路径切换"窗口内会出现可测量的中断；这是测量对象本身（见 `ARCHITECTURE.md` §6）。
+> 本交付的切换实现**不包含 gNB 间数据转发**，因此 DL 在"UE 迁移 → 5GC 路径切换"窗口内可能会出现可测量的中断；
+> 这是测量对象本身（见 `ARCHITECTURE.md` §6）。
+> **实测（2026-09-29，docker_open5gs VoNR）**：两次切换（gNB1→gNB2→gNB1）窗口内的 RTP 双向最大包间隔为
+> **39.8–40.9 ms**（阈值 60 ms 内，无中断记录），即本例的切换窗口短于 3 个 RTP 包间隔；
+> 证据见 `deploy/open5gs/evidence/ims-handover-summary.txt`。

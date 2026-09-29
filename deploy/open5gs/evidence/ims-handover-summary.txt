@@ -1,0 +1,57 @@
+VoNR N2-handover acceptance - measured summary (docker_open5gs, PLMN 001/01, 2026-09-29)
+================================================================================
+
+Test: UE1 calls UE2 (auto-answer), then UE1 is handed over gNB1 -> gNB2 -> gNB1
+while the call is up. RTP is captured in the rtpengine network namespace.
+
+-- call state after both handovers, UE1 --
+{
+ state: "REGISTERED",
+ registered: true,
+ expires: 300,
+ retryCount: 0,
+ bound: true,
+ psi: 2,
+ localIp: "192.168.101.4",
+ error: "",
+ callState: "CONFIRMED",
+ callId: "1790696982675-68@192.168.101.4",
+ remote: "sip:001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+ mediaTxCount: 1419,
+ mediaRxCount: 14613,
+ smsResult: "",
+ smsHistory: ""
+}
+
+-- call state after both handovers, UE2 --
+{
+ state: "REGISTERED",
+ registered: true,
+ expires: 300,
+ retryCount: 0,
+ bound: true,
+ psi: 2,
+ localIp: "192.168.101.6",
+ error: "",
+ callState: "CONFIRMED",
+ callId: "1790696982675-68@192.168.101.4",
+ remote: "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+ mediaTxCount: 1423,
+ mediaRxCount: 1422,
+ smsResult: "",
+ smsHistory: ""
+}
+
+-- RTP gap analysis (75 s capture, both handovers inside) --
+ue1 downlink (rtpengine->ue1): packets=3568 duration=74.94s max_gap=39.8ms gaps>60ms=0
+ue1 uplink   (ue1->rtpengine): packets=3569 duration=74.96s max_gap=40.9ms gaps>60ms=0
+ue2 downlink (rtpengine->ue2): packets=3569 duration=74.96s max_gap=40.9ms gaps>60ms=0
+ue2 uplink   (ue2->rtpengine): packets=3568 duration=74.94s max_gap=39.7ms gaps>60ms=0
+
+-- ho-events correlation (last two handovers) --
+ho_id 1877681885132357634:
+  UERANSIM-gnb-1-1-1: HO_REQUIRED_SENT, HO_COMMAND_RECEIVED, RRC_RECFG_SENT, UE_CTX_RELEASE_RECEIVED
+  UERANSIM-gnb-1-1-2: HO_REQUEST_RECEIVED, HO_ACK_SENT, RRC_RECFG_COMPLETE_RECEIVED, HO_NOTIFY_SENT
+ho_id 1877681898117922818:
+  UERANSIM-gnb-1-1-1: HO_REQUEST_RECEIVED, HO_ACK_SENT, RRC_RECFG_COMPLETE_RECEIVED, HO_NOTIFY_SENT
+  UERANSIM-gnb-1-1-2: HO_REQUIRED_SENT, HO_COMMAND_RECEIVED, RRC_RECFG_SENT, UE_CTX_RELEASE_RECEIVED

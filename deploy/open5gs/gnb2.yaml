@@ -1,0 +1,19 @@
+mcc: '001'
+mnc: '01'
+
+nci: '0x000000020'   # gNB ID 2, cell ID 0 (idLength 32)
+idLength: 32
+tac: 1
+
+linkIp: 172.22.0.92
+ngapIp: 172.22.0.92
+gtpIp: 172.22.0.92
+
+amfConfigs:
+  - address: 172.22.0.10
+    port: 38412
+
+slices:
+  - sst: 1
+
+ignoreStreamIds: true
