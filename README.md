@@ -63,7 +63,8 @@ ueransim-N2handover/
 └── docs/
     ├── ARCHITECTURE.md          实现架构、仿真身份设计、与规范的对应与简化点
     ├── BUILD.md                 构建（含与 ueransim-ims 补丁共存的验证）
-    └── RUN.md                   端到端运行（free5GC/Open5GS）、触发切换、验证与排错
+    ├── RUN.md                   端到端运行（free5GC/Open5GS）、触发切换、验证与排错
+    └── REGRESSION.md            本地回归测试记录（含基线对照实验）
 ```
 
 ## 快速开始
@@ -91,6 +92,7 @@ ctest --output-on-failure
 | 与 `ueransim-ims/patch/ims.patch` 共存（两种顺序） | ✅ 已验证（原生与 Docker 均为：apply + 编译 + 2/2 测试） |
 | 单元测试（`ho-tests`） | ✅ 14 项通过 |
 | 端到端（free5GC v4.2.3 compose，双 gNB + UE，**交付包文件原样**） | ✅ 已验证：多次切换（含反向），单次全过程约 27 ms；切换前后 ping 0% 丢包；`tcpdump` 证实切换后 GTP 仅经目标 gNB。详见 `docs/RUN.md` §9 |
+| **本地回归测试**（多 UE、多 PDU 会话、失败路径、基线对照） | ✅ 全部通过，未引入回归；详见 `docs/REGRESSION.md` |
 
 ## 简化点（重要）
 

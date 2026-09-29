@@ -165,9 +165,10 @@ Open5GS 的 UPF 为**用户态**（`ogstun`，无需 gtp5g 内核模块），部
 
 ## 8. 已知简化（运行相关）
 
-- 切换窗口内**无 gNB 间转发**：DL 数据在 Handover Notify 前可能短暂丢失；UL 在 UE 迁移后立即可用。
+- 切换窗口内**无 gNB 间转发**：DL 数据在 Handover Notify 前可能短暂丢失；UL 在 UE 迁移后立即可用。路径切换后 UPF 的 End Marker 会被 GTP 层记录为 `Unhandled GTP-U message type: 254`（无转发时可直接忽略）。
 - 触发方式为 CLI（代替测量报告）；两 gNB 需同 PLMN/TAC（或自行扩展）。
 - 不做 RAN Status Transfer / DAPS / Handover Cancel（见 `ARCHITECTURE.md` §6）。
+- `ue-release` 释放 UE 后，UE 由上行数据触发原地恢复（Service Request）受**上游 UERANSIM v3.3.0 的 `selectAmf` 限制**（无 Requested NSSAI 时无法选择 AMF，未打补丁基线同样如此）；**重启 UE** 可正常恢复。详见 `REGRESSION.md` 观察 1。
 
 ## 9. 实测记录（free5GC v4.2.3 容器）
 
