@@ -1,0 +1,52 @@
+== Open5GS v2 data forwarding acceptance (2026-10-01) ==
+build: UERANSIM v3.3.0 + n2handover.patch (v2, commit d0a2940) + ims.patch (combined)
+
+-- call/media counters (after 10 round trips / 20 handovers) --
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue1.txt: callState: "CONFIRMED",
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue1.txt: mediaTxCount: 12426,
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue1.txt: mediaRxCount: 12426,
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue2.txt: callState: "CONFIRMED",
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue2.txt: mediaTxCount: 12430,
+/tmp/opencode/v2-o5gs-run/ims-ho-results/after-ue2.txt: mediaRxCount: 12429,
+
+-- RTP gap analysis + control plane --
+handovers analysed: 20 (threshold 60 ms)
+RTP gaps (ms), ue1 = handed-over UE, ue2 = control:
+  ue1 DL: n=20 min=21.3 med=35.0 p90=39.2 max=40.3 gaps>60ms=0
+  ue1 UL: n=20 min=22.9 med=33.3 p90=38.6 max=40.9 gaps>60ms=0
+  ue2 DL: n=20 min=23.0 med=33.3 p90=38.6 max=40.9 gaps>60ms=0
+  ue2 UL: n=20 min=21.3 med=35.0 p90=39.2 max=40.2 gaps>60ms=0
+control-plane phase durations (ms per handover):
+  prep(req->reqrecv): 12 12 11 13 13 12 13 13 12 13 13 12 12 12 12 12 12 11 13 13
+  ran(recfg->recfgcmpl): 0 0 0 1 0 0 0 0 0 0 0 1 0 1 1 0 1 0 0 1
+  exec(cmd->notify): 1 0 0 1 0 0 0 0 0 0 1 1 0 1 1 0 1 0 1 1
+  release(notify->ctxrel): 502 508 507 502 500 504 507 508 502 506 501 501 507 506 506 508 500 502 502 506
+
+-- data forwarding activity (source gNB excerpts) --
+[2026-09-30 17:50:48.287] [gtp] [info] N2 handover: data forwarding active, first packet sent to the forwarding TNL (QFI[2])
+[2026-09-30 17:50:48.779] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[2] (10 packet(s) forwarded)
+[2026-09-30 17:50:48.779] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[1] (0 packet(s) forwarded)
+[2026-09-30 17:50:48.779] [gtp] [info] N2 handover: data forwarding stopped for UE[3], 10 packet(s) in total
+[2026-09-30 17:51:05.260] [gtp] [info] N2 handover: data forwarding started for UE[3], 2 session(s)
+[2026-09-30 17:51:05.275] [gtp] [info] N2 handover: data forwarding active, first packet sent to the forwarding TNL (QFI[2])
+[2026-09-30 17:51:05.763] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[2] (9 packet(s) forwarded)
+[2026-09-30 17:51:05.763] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[1] (0 packet(s) forwarded)
+[2026-09-30 17:51:05.763] [gtp] [info] N2 handover: data forwarding stopped for UE[3], 9 packet(s) in total
+  ...
+[2026-09-30 17:50:57.260] [gtp] [info] N2 handover: data forwarding stopped for UE[3], 9 packet(s) in total
+[2026-09-30 17:51:13.736] [gtp] [info] N2 handover: data forwarding started for UE[3], 2 session(s)
+[2026-09-30 17:51:13.738] [gtp] [info] N2 handover: data forwarding active, first packet sent to the forwarding TNL (QFI[2])
+[2026-09-30 17:51:14.243] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[2] (10 packet(s) forwarded)
+[2026-09-30 17:51:14.243] [gtp] [info] N2 handover: data forwarding stopped for UE[3] PSI[1] (0 packet(s) forwarded)
+[2026-09-30 17:51:14.243] [gtp] [info] N2 handover: data forwarding stopped for UE[3], 10 packet(s) in total
+
+-- target endpoints / flush (excerpts) --
+[2026-09-30 17:51:13.735] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[6647579028549388445] PSI[1], TEID[2147483667]
+[2026-09-30 17:51:13.735] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[6647579028549388445] PSI[2], TEID[2147483668]
+[2026-09-30 17:51:13.737] [gtp] [info] N2 handover: forwarding data flushed for UE[3] PSI[2] (0 packet(s); 0 received, 0 dropped); the endpoint remains a downlink alias of the session
+[2026-09-30 17:51:13.737] [gtp] [info] N2 handover: forwarding data flushed for UE[3] PSI[1] (0 packet(s); 0 received, 0 dropped); the endpoint remains a downlink alias of the session
+
+-- hygiene: UPF off-filter drops (expect 0) --
+4
+-- hygiene: TEID not found / timer noise (expect 0) --
+0

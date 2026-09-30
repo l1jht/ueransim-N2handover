@@ -165,7 +165,7 @@ Open5GS 的 UPF 为**用户态**（`ogstun`，无需 gtp5g 内核模块），部
 
 ## 8. 已知简化（运行相关）
 
-- 切换窗口内**无 gNB 间转发**：DL 数据在 Handover Notify 前可能短暂丢失；UL 在 UE 迁移后立即可用。路径切换后 UPF 的 End Marker 会被 GTP 层记录为 `Unhandled GTP-U message type: 254`（无转发时可直接忽略）。
+- 切换窗口内**有 gNB 间转发**（v2）：源侧把窗口内到达的 DL 重定向到 Handover Command 给出的转发 TNL；目标侧在自己公告的 TEID 上接收、缓存并在 UE 到达后按序交付；该 TEID 保留为**会话寿命别名**（部分核心网持续用它下发 DL）。End Marker 仍不转发（GTP 层记录 `Unhandled GTP-U message type: 254`）。
 - 触发方式为 CLI（代替测量报告）；两 gNB 需同 PLMN/TAC（或自行扩展）。
 - 不做 RAN Status Transfer / DAPS / Handover Cancel（见 `ARCHITECTURE.md` §6）。
 - `ue-release` 释放 UE 后，UE 由上行数据触发原地恢复（Service Request）受**上游 UERANSIM v3.3.0 的 `selectAmf` 限制**（无 Requested NSSAI 时无法选择 AMF，未打补丁基线同样如此）；**重启 UE** 可正常恢复。详见 `REGRESSION.md` 观察 1。
@@ -297,3 +297,23 @@ free5gc-rtp.txt.gz, compare-open5gs-free5gc.txt}`。
 4. ePCO 正常下发（`pcscf=10.100.200.47 (EPCO)`）；UE 配置中的静态 `ims.pcscf` 仅兜底。
 
 
+
+## 12. 数据转发（v2）验证要点
+
+> v2（2026-10-01）起，切换包含 gNB 间数据转发：源侧重定向 + 目标侧接收/缓存/会话寿命别名；无需核心网改造（free5GC=直连口味、Open5GS=间接口味，gNB 侧统一处理）。
+
+**日志对照（每次切换）**
+- 源 gNB：`PSI[p] DL forwarding TNL received (teid[...])` → `data forwarding started for UE[x], N session(s)` → 首包 `data forwarding active, first packet sent to the forwarding TNL (QFI[q])` → 释放时 `data forwarding stopped ... (N packet(s) forwarded)`；
+- 目标 gNB：`DL forwarding endpoint registered ... TEID[0x8000xxxx]` → UE 到达后 `forwarding data flushed ... the endpoint remains a downlink alias of the session`；
+- 定时器：`TNGRELOCprep`（5 s，Handover Required→Command）与 `TNGRELOCoverall`（10 s，Command→UE Context Release）正常时不打印；超时打印告警（prep 中止准备、overall 停转发并请求释放）。
+
+**验收命令**（与既有 IMS 验收相同脚本）
+
+```bash
+RUN_DIR=<results> HO_EVENTS_DIR=<compose-dir>/ho-events \
+  deploy/open5gs/run-ims-test.sh -n 10 -w 8 --start
+```
+
+**结果（2026-10-01，两核各 10 次往返/20 次切换）**：通话保持 CONFIRMED；RTP >60 ms 中断 0；UE 侧 `mediaTx/mediaRx` 差 0–3 包（约 0 丢包）；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/open5gs/evidence/ims-handover-summary-v2-forwarding.txt`、`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v2-forwarding.txt`。
+
+**排错提示（free5GC）**：若测试过程中出现**中断的切换流程**（例如对错误的 ue-id 触发），AMF 可能残留 `N2 handover is ongoing` 状态并拒绝该 UE 的后续注册（`Registration Reject [CONGESTION]`）；重启 `amf/smf/upf` 并重连 gNB/UE 即可恢复。

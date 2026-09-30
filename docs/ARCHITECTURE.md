@@ -106,12 +106,13 @@
 
 | TS 23.502 §4.9.1.3 步骤 | 实现 |
 |---|---|
-| 准备 1：Handover Required | ✅ 源 gNB `sendHandoverRequired`（含 TargetID、PDU 会话列表、Source-To-Target 容器、UE 历史；`directForwardingPathAvailability` 按"不转发"省略） |
+| 准备 1：Handover Required | ✅ 源 gNB `sendHandoverRequired`（含 TargetID、PDU 会话列表、Source-To-Target 容器、UE 历史；`directForwardingPathAvailability=directPathAvailable`，转发始终启用） |
 | 准备 4/7（SMF 交互） | 由 5GC 完成（本项目不实现 5GC） |
 | 准备 9：Handover Request | ✅ 目标 gNB `receiveHandoverRequest` |
 | 准备 10：Handover Request Acknowledge | ✅ 含 Admitted/Failed 列表、Target-To-Source 容器；失败用 Handover Failure |
-| 执行 1：Handover Command | ✅ 源 gNB 收包并解析 |
+| 执行 1：Handover Command | ✅ 源 gNB 收包、解析每会话 DL 转发 TNL（`PDUSessionResourceHandoverList`）并建立重定向 |
 | 执行 2：RRC 切换命令 | ✅ RRC Reconfiguration（仿真载荷） |
+| 执行 3：数据转发（3a/3b） | ✅ 源侧重定向（按命令给出的 TNL）+ 目标侧接收/缓存/会话寿命别名；封装携带 UL 变体 PDU Session Container（QFI） |
 | 执行 4：Handover Confirm | ✅ RRC Reconfiguration Complete → `HANDOVER_CONFIRM` |
 | 执行 5：Handover Notify | ✅ 自动附加 AMF-UE-NGAP-ID / RAN-UE-NGAP-ID / UserLocationInformation（复用既有 `sendNgapUeAssociated`） |
 | 执行 12：移动性注册更新 | ✅ TAI 变化时 UE NAS 触发（`ENTER_UNLISTED_TRACKING_AREA`）；同 TAC 时不触发 |
@@ -124,14 +125,14 @@
 |---|---|---|
 | 1 | 透明容器内为仿真载荷，非真实 RRC ASN.1；无 AS 安全（`SecurityContext`/`securityResult` 省略） | UERANSIM 空口为内部模拟，无真实 AS 层 |
 | 2 | 触发为 CLI（代替测量报告/无线原因判断） | 仿真触发手段 |
-| 3 | 不实现 gNB 间数据转发（无 `dLForwardingUP_TNLInformation`） | 切换窗口内 DL 丢包（UL 经目标立即可用，DL 在 Notify 后恢复） |
+| 3 | 转发为**会话级**（非 QoS 流级）；无 PDCP SN/重排序（FIFO 缓存 + "flush 先于新数据"）；End Marker 不转发（v2.0） | 仿真中 QoS 流级与 PDCP 重排序不可观测；转发已实现（v2，2026-10-01） |
 | 4 | 不实现 RAN Status Transfer / PDCP SN 与 HFN 保持 | 无损切换语义不模拟 |
 | 5 | 不实现 DAPS、Handover Cancel、Handover Success | 基础场景之外 |
-| 6 | 无 TNGRELOCprep/TNGRELOCoverall 定时器（源侧） | 目标侧有 pending 超时清理；源侧失败仅在日志可见 |
+| 6 | TNGRELOCprep/TNGRELOCoverall 已实现（常数 5 s / 10 s） | prep 超时本地中止（不发 Handover Cancel，偏差）；overall 超时停止转发并请求释放（TS 38.413 §8.4.1.2/§9.6） |
 | 7 | 目标小区 NCI 由 gNB ID 约定推导（见 §3.4） | 仿真中替代 ANR/OAM |
 | 8 | 假定两 gNB 同 PLMN/TAC（TargetID 的 selectedTAI 用源侧配置） | 基础场景；跨 PLMN/TAC 需扩展 |
 | 9 | 每次 Handover Required 携带"全部 PDU 会话" | 与规范一致；但 QoS 流级失败处理从简（会话级） |
-| 10 | gNB 间数据转发未实现（**v2 扩展点**：源侧 GTP 重定向 + 目标侧转发隧道接入，属中等改动） | 属"缩短中断"类优化研究，当前场景为**测量**性质（DL 中断窗口即测量对象） |
+| 10 | 目标公告的转发 TEID 按**会话寿命别名**保留（不随窗口释放） | Open5GS 实测把该 TNL 用作会话常规 DL 路径（释放即 DL 黑洞）；free5GC 下为空闲条目 |
 
 ## 7. 与 ueransim-ims 补丁的共存设计
 

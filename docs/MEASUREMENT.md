@@ -122,8 +122,8 @@ docker exec gnb1 tail -n 20 /ueransim/logs/UERANSIM-gnb-208-93-1.ho-events.jsonl
 - **丢包率**：按序列号（需要 RTP 级别的 seq 解析；本交付给到的是包到达时间线，seq 级分析可结合抓包工具的 RTP 解析）；
 - **方向**：按源/目的地址区分 UL/DL，分别统计（DL 中断窗口在切换前后由 5GC 路径切换决定）。
 
-> 本交付的切换实现**不包含 gNB 间数据转发**，因此 DL 在"UE 迁移 → 5GC 路径切换"窗口内可能会出现可测量的中断；
-> 这是测量对象本身（见 `ARCHITECTURE.md` §6）。
-> **实测（2026-09-29，docker_open5gs VoNR）**：两次切换（gNB1→gNB2→gNB1）窗口内的 RTP 双向最大包间隔为
-> **39.8–40.9 ms**（阈值 60 ms 内，无中断记录），即本例的切换窗口短于 3 个 RTP 包间隔；
-> 证据见 `deploy/open5gs/evidence/ims-handover-summary.txt`。
+> v2（2026-10-01）起切换**包含 gNB 间数据转发**：DL 在"UE 迁移 → 5GC 路径切换"窗口内由源侧重定向、目标侧缓存/交付，
+> 因此 **UE 侧媒体计数（`mediaTx`/`mediaRx` 差分）应接近零差**；rtpengine 侧缺口仍以 UL 方向（UE 切换窗口）为主。
+> **实测（2026-10-01，free5GC/Open5GS 各 20 次切换）**：ue1 计数差 0–3 包、RTP >60 ms 中断 0（max ~41 ms，与 v1 归档一致）；
+> v1 归档（2026-09-29）：两次切换 RTP 双向最大包间隔 39.8–40.9 ms、无 >60 ms 中断；
+> 证据见 `deploy/*/evidence/*v2-forwarding*` 与 `ims-handover-summary.txt`。

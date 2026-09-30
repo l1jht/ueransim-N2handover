@@ -110,19 +110,20 @@ ctest --output-on-failure
 |---|---|
 | 补丁独立应用（v3.3.0） | ✅ 已验证（宿主机原生 + Docker 两种构建方式） |
 | 与 `ueransim-ims/patch/ims.patch` 共存（两种顺序） | ✅ 已验证（原生与 Docker 均为：apply + 编译 + 2/2 测试） |
-| 单元测试（`ho-tests`） | ✅ 14 项通过 |
+| 单元测试（`ho-tests`） | ✅ 23 项通过（含转发缓冲 9 项） |
 | 端到端（free5GC v4.2.3 compose，双 gNB + UE，**交付包文件原样**） | ✅ 已验证：多次切换（含反向），单次全过程约 27 ms；切换前后 ping 0% 丢包；`tcpdump` 证实切换后 GTP 仅经目标 gNB。详见 `docs/RUN.md` §9 |
 | **本地回归测试**（多 UE、多 PDU 会话、失败路径、基线对照） | ✅ 全部通过，未引入回归；详见 `docs/REGRESSION.md` |
 | 结构化事件日志 + 批量驱动 | ✅ free5GC 实测（3 次往返切换，`ho_id` 两侧一致、宿主机可见 JSONL）；详见 `docs/MEASUREMENT.md` |
 | **Open5GS 兼容性**（docker_open5gs `sa-vonr-deploy`，双 gNB + 双 UE） | ✅ 已验证：接入/双 PDU 会话/反复 N2 切换正常；详见 `docs/RUN.md` §10 |
 | **IMS 通话中切换验收**（VoNR，下游场景） | ✅ 已验证：通话经 gNB1→gNB2→gNB1 两次切换保持 CONFIRMED；RTP 最大间隔 39.8–40.9 ms、>60 ms 中断 0；证据 `deploy/open5gs/evidence/` |
 | **free5GC + IMS 验收**（方案 L；与 Open5GS 同协议对比） | ✅ 已验证：10 次往返（20 次切换）通话保持 CONFIRMED；RTP 最大间隔 ~41 ms、>60 ms 中断 0；**SMS 双向收发**（TS 24.341，`delivered (202)` + 对端收到）；双核控制面时序差异已记录；证据 `deploy/free5gc-ims/evidence/`；详见 `docs/RUN.md` §11 |
+| **数据转发（v2，2026-10-01）** | ✅ 已验证：free5GC/Open5GS 各 10 次往返（20 次切换）通话保持 CONFIRMED；UE 侧 `mediaTx/mediaRx` 差 0–3 包、RTP >60 ms 中断 0；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/*/evidence/*v2-forwarding*`；详见 `docs/RUN.md` §12 |
 
 ## 简化点（重要）
 
 UERANSIM 仿真"空口"，因此以下内容按仿真方式实现或有意省略（详见 `docs/ARCHITECTURE.md` 第 6 节）：
 
 - 透明容器内的 RRC 载荷为**仿真自定义格式**（标准 NGAP 信封不变）；无 AS 安全
-- **不做** gNB 间数据转发（无 3a/3b），DL 数据在 Handover Notify 后由 5GC 直接切到目标
+- **已实现 gNB 间数据转发**（v2，2026-10-01）：源侧重定向 + 目标侧接收/缓存/会话寿命别名；直连与间接两种核心网口味统一处理；转发封装按隧道方向携带 UL 变体 PDU Session Container（QFI）
 - **不做** RAN Status Transfer / PDCP SN 保持、DAPS、Handover Cancel、AMF 重定位
 - 触发方式为 CLI（代替测量报告）；目标小区 NCI 由目标 gNB ID 按约定推导

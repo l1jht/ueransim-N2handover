@@ -56,11 +56,162 @@ index a9a0a88..a2956d0 100644
      base->appTask = new GnbAppTask(base);
      base->sctpTask = new SctpTask(base);
      base->ngapTask = new NgapTask(base);
+diff --git a/src/gnb/gtp/forwarding.cpp b/src/gnb/gtp/forwarding.cpp
+new file mode 100644
+index 0000000..c16b408
+--- /dev/null
++++ b/src/gnb/gtp/forwarding.cpp
+@@ -0,0 +1,44 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#include "forwarding.hpp"
++
++namespace nr::gnb
++{
++
++void ForwardingBuffer::push(OctetString &&pdu)
++{
++    m_bytes += static_cast<std::size_t>(pdu.length());
++    m_packets.emplace_back(std::move(pdu));
++
++    while (!m_packets.empty() && (m_packets.size() > MAX_PACKETS || m_bytes > MAX_BYTES))
++        dropOldest();
++}
++
++OctetString ForwardingBuffer::pop()
++{
++    if (m_packets.empty())
++        return OctetString{};
++
++    OctetString pdu = std::move(m_packets.front());
++    m_packets.pop_front();
++    m_bytes -= static_cast<std::size_t>(pdu.length());
++    return pdu;
++}
++
++void ForwardingBuffer::dropOldest()
++{
++    if (m_packets.empty())
++        return;
++
++    m_bytes -= static_cast<std::size_t>(m_packets.front().length());
++    m_packets.pop_front();
++    m_dropped++;
++}
++
++} // namespace nr::gnb
+diff --git a/src/gnb/gtp/forwarding.hpp b/src/gnb/gtp/forwarding.hpp
+new file mode 100644
+index 0000000..25a2bd5
+--- /dev/null
++++ b/src/gnb/gtp/forwarding.hpp
+@@ -0,0 +1,68 @@
++//
++// This file is a part of UERANSIM project.
++// Copyright (c) 2023 ALİ GÜNGÖR.
++//
++// https://github.com/aligungr/UERANSIM/
++// See README, LICENSE, and CONTRIBUTING files for licensing details.
++//
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <deque>
++
++#include <utils/octet_string.hpp>
++
++namespace nr::gnb
++{
++
++// Bounded FIFO buffer that holds user plane payloads forwarded to the target gNB before the UE
++// arrives on the target cell (N2 handover data forwarding, see the delivery documentation).
++//
++// The class is intentionally free of task dependencies so that the buffering policy (ordering,
++// limits, drop-oldest) can be unit tested.
++class ForwardingBuffer
++{
++  public:
++    // Bounds protect the target node from unbounded memory usage. The expected occupancy is the
++    // amount of data forwarded during the (sub-second) handover window.
++    static constexpr std::size_t MAX_PACKETS = 256;
++    static constexpr std::size_t MAX_BYTES = 1024 * 1024;
++
++    // Appends a payload. If a limit is exceeded, the oldest payload is dropped.
++    void push(OctetString &&pdu);
++
++    // Removes and returns the oldest payload. The result is empty if the buffer is empty.
++    OctetString pop();
++
++    bool empty() const
++    {
++        return m_packets.empty();
++    }
++
++    std::size_t size() const
++    {
++        return m_packets.size();
++    }
++
++    std::size_t bytes() const
++    {
++        return m_bytes;
++    }
++
++    // Number of payloads dropped because of the limits above.
++    std::uint64_t dropped() const
++    {
++        return m_dropped;
++    }
++
++  private:
++    void dropOldest();
++
++    std::deque<OctetString> m_packets{};
++    std::size_t m_bytes{};
++    std::uint64_t m_dropped{};
++};
++
++} // namespace nr::gnb
 diff --git a/src/gnb/gtp/task.cpp b/src/gnb/gtp/task.cpp
-index 0475dcb..47b02d9 100644
+index 0475dcb..73d221a 100644
 --- a/src/gnb/gtp/task.cpp
 +++ b/src/gnb/gtp/task.cpp
-@@ -113,12 +113,34 @@ void GtpTask::handleSessionCreate(PduSessionResource *session)
+@@ -74,6 +74,26 @@ void GtpTask::onLoop()
+             handleSessionRelease(w.ueId, w.psi);
+             break;
+         }
++        case NmGnbNgapToGtp::HANDOVER_FORWARDING_SETUP: {
++            handleForwardingSetup(w);
++            break;
++        }
++        case NmGnbNgapToGtp::HANDOVER_FORWARDING_START: {
++            handleForwardingStart(w);
++            break;
++        }
++        case NmGnbNgapToGtp::HANDOVER_FORWARDING_FLUSH: {
++            handleForwardingFlush(w);
++            break;
++        }
++        case NmGnbNgapToGtp::HANDOVER_FORWARDING_STOP: {
++            handleForwardingStop(w.ueId);
++            break;
++        }
++        case NmGnbNgapToGtp::HANDOVER_FORWARDING_TEARDOWN: {
++            handleForwardingTeardown(w.hoSti);
++            break;
++        }
+         }
+         break;
+     }
+@@ -113,12 +133,34 @@ void GtpTask::handleSessionCreate(PduSessionResource *session)
      if (!m_ueContexts.count(session->ueId))
      {
          m_logger->err("PDU session resource could not be created, UE context with ID[%d] not found", session->ueId);
@@ -96,8 +247,335 @@ index 0475dcb..47b02d9 100644
      m_sessionTree.insert(sessionInd, session->downTunnel.teid);
  
      updateAmbrForUe(session->ueId);
+@@ -174,6 +216,16 @@ void GtpTask::handleUeContextDelete(int ueId)
+     m_rateLimiter->updateUeUplinkLimit(ueId, 0);
+     m_rateLimiter->updateUeDownlinkLimit(ueId, 0);
+ 
++    // N2 handover data forwarding state of this UE: source-side redirects and target-side aliases.
++    handleForwardingStop(ueId);
++    for (auto it = m_forwardingIncoming.begin(); it != m_forwardingIncoming.end();)
++    {
++        if (it->second.ueId == ueId)
++            it = m_forwardingIncoming.erase(it);
++        else
++            ++it;
++    }
++
+     // Remove UE context
+     m_ueContexts.erase(ueId);
+ }
+@@ -228,20 +280,57 @@ void GtpTask::handleUdpReceive(const udp::NwUdpServerReceive &msg)
+     {
+     case gtp::GtpMessage::MT_G_PDU: {
+         auto sessionInd = m_sessionTree.findByDownTeid(gtp->teid);
+-        if (sessionInd == 0)
++        if (sessionInd != 0)
+         {
+-            m_logger->err("TEID %d not found on GTP-U Downlink", gtp->teid);
++            // Source side during an N2 handover: redirect the downlink data to the forwarding TNL
++            // announced in the Handover Command instead of delivering it over the radio.
++            auto redirectIt = m_forwardingRedirects.find(sessionInd);
++            if (redirectIt != m_forwardingRedirects.end())
++            {
++                forwardToRedirect(redirectIt->second, *gtp);
++                return;
++            }
++
++            deliverDownlink(sessionInd, std::move(gtp->payload));
+             return;
+         }
+ 
+-        if (m_rateLimiter->allowDownlinkPacket(sessionInd, gtp->payload.length()))
++        // Target side: data received on a DL forwarding endpoint announced in the Handover Request
++        // Acknowledge. Before the UE arrives the payloads are buffered, afterwards (and for the rest
++        // of the session lifetime) they are delivered directly to the UE.
++        auto incomingIt = m_forwardingIncoming.find(gtp->teid);
++        if (incomingIt != m_forwardingIncoming.end())
+         {
+-            auto w = std::make_unique<NmGnbGtpToRls>(NmGnbGtpToRls::DATA_PDU_DELIVERY);
+-            w->ueId = GetUeId(sessionInd);
+-            w->psi = GetPsi(sessionInd);
+-            w->pdu = std::move(gtp->payload);
+-            m_base->rlsTask->push(std::move(w));
++            auto &entry = incomingIt->second;
++            entry.received++;
++
++            if (!entry.alias)
++            {
++                auto droppedBefore = entry.buffer.dropped();
++                entry.buffer.push(std::move(gtp->payload));
++                if (entry.buffer.dropped() != droppedBefore)
++                    m_logger->warn("N2 handover: forwarding buffer overflow for PSI[%d], oldest packet dropped",
++                                   entry.psi);
++                return;
++            }
++
++            // The endpoint remains a downlink alias of the session. If the UE is handed over away
++            // from this node again, data arriving on the alias must be forwarded as well (some core
++            // networks keep sending downlink data to the announced forwarding endpoint).
++            uint64_t aliasSessionInd = MakeSessionResInd(entry.ueId, entry.psi);
++            auto aliasRedirectIt = m_forwardingRedirects.find(aliasSessionInd);
++            if (aliasRedirectIt != m_forwardingRedirects.end())
++            {
++                forwardToRedirect(aliasRedirectIt->second, *gtp);
++                return;
++            }
++
++            deliverDownlink(aliasSessionInd, std::move(gtp->payload));
++            entry.delivered++;
++            return;
+         }
++
++        m_logger->err("TEID %d not found on GTP-U Downlink", gtp->teid);
+         return;
+     }
+     case gtp::GtpMessage::MT_ECHO_REQUEST: {
+@@ -264,6 +353,182 @@ void GtpTask::handleUdpReceive(const udp::NwUdpServerReceive &msg)
+     }
+ }
+ 
++void GtpTask::handleForwardingSetup(NmGnbNgapToGtp &msg)
++{
++    for (auto &session : msg.hoForwardingTeids)
++    {
++        int psi = session.first;
++        uint32_t teid = session.second;
++
++        if (m_sessionTree.findByDownTeid(teid) != 0)
++        {
++            m_logger->err("N2 handover: forwarding TEID[%u] collides with an existing downlink TEID, PSI[%d] skipped",
++                          teid, psi);
++            continue;
++        }
++        if (m_forwardingIncoming.count(teid) != 0)
++            m_logger->warn("N2 handover: forwarding TEID[%u] was already registered, replacing it", teid);
++
++        ForwardingIncoming entry{};
++        entry.sti = msg.hoSti;
++        entry.psi = psi;
++        m_forwardingIncoming[teid] = std::move(entry);
++
++        m_logger->info("N2 handover: DL forwarding endpoint registered for sti[%llu] PSI[%d], TEID[%u]",
++                       (unsigned long long)msg.hoSti, psi, teid);
++    }
++}
++
++void GtpTask::handleForwardingStart(NmGnbNgapToGtp &msg)
++{
++    for (auto &session : msg.hoForwardingTunnels)
++    {
++        ForwardingRedirect redirect{};
++        redirect.tunnel = std::move(session.second);
++
++        m_forwardingRedirects[MakeSessionResInd(msg.ueId, session.first)] = std::move(redirect);
++    }
++
++    if (!msg.hoForwardingTunnels.empty())
++        m_logger->info("N2 handover: data forwarding started for UE[%d], %zu session(s)", msg.ueId,
++                       msg.hoForwardingTunnels.size());
++}
++
++void GtpTask::handleForwardingFlush(NmGnbNgapToGtp &msg)
++{
++    for (auto &item : m_forwardingIncoming)
++    {
++        auto &entry = item.second;
++        if (entry.sti != msg.hoSti)
++            continue;
++
++        entry.ueId = msg.hoUeId;
++        entry.alias = true;
++
++        uint64_t sessionInd = MakeSessionResInd(entry.ueId, entry.psi);
++        uint64_t flushed = 0;
++        while (!entry.buffer.empty())
++        {
++            deliverDownlink(sessionInd, entry.buffer.pop());
++            flushed++;
++        }
++        entry.delivered += flushed;
++
++        m_logger->info("N2 handover: forwarding data flushed for UE[%d] PSI[%d] (%llu packet(s); %llu received, "
++                       "%llu dropped); the endpoint remains a downlink alias of the session",
++                       entry.ueId, entry.psi, (unsigned long long)flushed, (unsigned long long)entry.received,
++                       (unsigned long long)entry.buffer.dropped());
++    }
++}
++
++void GtpTask::handleForwardingStop(int ueId)
++{
++    uint64_t total = 0;
++    int sessions = 0;
++    for (auto it = m_forwardingRedirects.begin(); it != m_forwardingRedirects.end();)
++    {
++        if (GetUeId(it->first) == ueId)
++        {
++            m_logger->info("N2 handover: data forwarding stopped for UE[%d] PSI[%d] (%llu packet(s) forwarded)", ueId,
++                           GetPsi(it->first), (unsigned long long)it->second.packets);
++            total += it->second.packets;
++            sessions++;
++            it = m_forwardingRedirects.erase(it);
++        }
++        else
++        {
++            ++it;
++        }
++    }
++
++    if (sessions > 0)
++        m_logger->info("N2 handover: data forwarding stopped for UE[%d], %llu packet(s) in total", ueId,
++                       (unsigned long long)total);
++}
++
++void GtpTask::handleForwardingTeardown(uint64_t sti)
++{
++    for (auto it = m_forwardingIncoming.begin(); it != m_forwardingIncoming.end();)
++    {
++        if (it->second.sti == sti)
++        {
++            m_logger->info("N2 handover: forwarding endpoint released for sti[%llu] PSI[%d] (%llu received, "
++                           "%llu dropped)",
++                           (unsigned long long)sti, it->second.psi, (unsigned long long)it->second.received,
++                           (unsigned long long)it->second.buffer.dropped());
++            it = m_forwardingIncoming.erase(it);
++        }
++        else
++        {
++            ++it;
++        }
++    }
++}
++
++void GtpTask::forwardToRedirect(ForwardingRedirect &redirect, gtp::GtpMessage &incoming)
++{
++    // Determine the QFI of the forwarded data, if the received packet carried a PDU session
++    // container (TS 38.415).
++    int qfi = -1;
++    for (auto &ext : incoming.extHeaders)
++    {
++        auto *container = dynamic_cast<gtp::PduSessionContainerExtHeader *>(ext.get());
++        if (container == nullptr || container->pduSessionInformation == nullptr)
++            continue;
++
++        if (auto *dl = dynamic_cast<gtp::DlPduSessionInformation *>(container->pduSessionInformation.get()))
++            qfi = dl->qfi;
++        else if (auto *ul = dynamic_cast<gtp::UlPduSessionInformation *>(container->pduSessionInformation.get()))
++            qfi = ul->qfi;
++    }
++
++    gtp::GtpMessage gtp{};
++    gtp.msgType = gtp::GtpMessage::MT_G_PDU;
++    gtp.teid = redirect.tunnel.teid;
++
++    // The forwarded packet travels towards the UPF (indirect forwarding) or the target gNB (direct
++    // forwarding). The PDU session container carries the QoS flow of the data; in the direction of
++    // this tunnel the uplink variant is used (the core network matches the forwarding rules on it).
++    if (qfi >= 0)
++    {
++        auto pduSessionInfo = std::make_unique<gtp::UlPduSessionInformation>();
++        pduSessionInfo->qfi = qfi;
++
++        auto container = std::make_unique<gtp::PduSessionContainerExtHeader>();
++        container->pduSessionInformation = std::move(pduSessionInfo);
++        gtp.extHeaders.push_back(std::move(container));
++    }
++    gtp.payload = std::move(incoming.payload);
++
++    OctetString gtpPdu;
++    if (!gtp::EncodeGtpMessage(gtp, gtpPdu))
++    {
++        m_logger->err("N2 handover: data forwarding failed, GTP encoding failed");
++        return;
++    }
++
++    m_udpServer->send(InetAddress(redirect.tunnel.address, cons::GtpPort), gtpPdu);
++
++    redirect.packets++;
++    if (!redirect.firstLogged)
++    {
++        redirect.firstLogged = true;
++        m_logger->info("N2 handover: data forwarding active, first packet sent to the forwarding TNL (QFI[%d])", qfi);
++    }
++}
++
++void GtpTask::deliverDownlink(uint64_t sessionInd, OctetString &&pdu)
++{
++    if (!m_rateLimiter->allowDownlinkPacket(sessionInd, static_cast<uint64_t>(pdu.length())))
++        return;
++
++    auto w = std::make_unique<NmGnbGtpToRls>(NmGnbGtpToRls::DATA_PDU_DELIVERY);
++    w->ueId = GetUeId(sessionInd);
++    w->psi = GetPsi(sessionInd);
++    w->pdu = std::move(pdu);
++    m_base->rlsTask->push(std::move(w));
++}
++
+ void GtpTask::updateAmbrForUe(int ueId)
+ {
+     if (!m_ueContexts.count(ueId))
+diff --git a/src/gnb/gtp/task.hpp b/src/gnb/gtp/task.hpp
+index 6111b9b..5e8cbb5 100644
+--- a/src/gnb/gtp/task.hpp
++++ b/src/gnb/gtp/task.hpp
+@@ -8,6 +8,8 @@
+ 
+ #pragma once
+ 
++#include "forwarding.hpp"
++#include "proto.hpp"
+ #include "utils.hpp"
+ 
+ #include <memory>
+@@ -35,6 +37,32 @@ class GtpTask : public NtsTask
+     std::unordered_map<uint64_t, std::unique_ptr<PduSessionResource>> m_pduSessions;
+     PduSessionTree m_sessionTree;
+ 
++    /* N2 handover data forwarding (see the delivery documentation).
++     * Source side: sessions whose downlink data is redirected to an announced forwarding TNL.
++     * Target side: forwarding endpoints announced in the Handover Request Acknowledge; payloads are
++     * buffered until the UE arrives and are delivered directly afterwards (the endpoint remains a
++     * downlink alias of the session for its lifetime). */
++    struct ForwardingRedirect
++    {
++        GtpTunnel tunnel{};
++        uint64_t packets{};
++        bool firstLogged{};
++    };
++
++    struct ForwardingIncoming
++    {
++        uint64_t sti{};
++        int psi{};
++        int ueId{-1};
++        bool alias{};
++        ForwardingBuffer buffer{};
++        uint64_t received{};
++        uint64_t delivered{};
++    };
++
++    std::unordered_map<uint64_t, ForwardingRedirect> m_forwardingRedirects{};
++    std::unordered_map<uint32_t, ForwardingIncoming> m_forwardingIncoming{};
++
+     friend class GnbCmdHandler;
+ 
+   public:
+@@ -54,6 +82,14 @@ class GtpTask : public NtsTask
+     void handleUeContextDelete(int ueId);
+     void handleUplinkData(int ueId, int psi, OctetString &&data);
+ 
++    void handleForwardingSetup(NmGnbNgapToGtp &msg);
++    void handleForwardingStart(NmGnbNgapToGtp &msg);
++    void handleForwardingFlush(NmGnbNgapToGtp &msg);
++    void handleForwardingStop(int ueId);
++    void handleForwardingTeardown(uint64_t sti);
++    void forwardToRedirect(ForwardingRedirect &redirect, gtp::GtpMessage &incoming);
++    void deliverDownlink(uint64_t sessionInd, OctetString &&pdu);
++
+     void updateAmbrForUe(int ueId);
+     void updateAmbrForSession(uint64_t pduSession);
+ };
 diff --git a/src/gnb/ngap/context.cpp b/src/gnb/ngap/context.cpp
-index 95a43cf..863c40f 100644
+index 95a43cf..e63cefb 100644
 --- a/src/gnb/ngap/context.cpp
 +++ b/src/gnb/ngap/context.cpp
 @@ -12,6 +12,7 @@
@@ -108,10 +586,14 @@ index 95a43cf..863c40f 100644
  
  #include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
  #include <asn/ngap/ASN_NGAP_AssociatedQosFlowItem.h>
-@@ -236,6 +237,20 @@ void NgapTask::receiveContextRelease(int amfId, ASN_NGAP_UEContextReleaseCommand
+@@ -236,6 +237,24 @@ void NgapTask::receiveContextRelease(int amfId, ASN_NGAP_UEContextReleaseCommand
      if (ue == nullptr)
          return;
  
++    // The UE Context Release stops TNGRELOCoverall (TS 38.413 8.4.1.2)
++    ue->hoPrepTimerActive = false;
++    ue->hoOverallTimerActive = false;
++
 +    {
 +        ho::HoEvent event{};
 +        event.hoId = ue->hoId;
@@ -131,10 +613,10 @@ index 95a43cf..863c40f 100644
      w1->ueId = ue->ctxId;
 diff --git a/src/gnb/ngap/handover.cpp b/src/gnb/ngap/handover.cpp
 new file mode 100644
-index 0000000..f6447c7
+index 0000000..e5ea626
 --- /dev/null
 +++ b/src/gnb/ngap/handover.cpp
-@@ -0,0 +1,797 @@
+@@ -0,0 +1,964 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -170,9 +652,11 @@ index 0000000..f6447c7
 +#include <utils/common.hpp>
 +
 +#include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
++#include <asn/ngap/ASN_NGAP_DirectForwardingPathAvailability.h>
 +#include <asn/ngap/ASN_NGAP_GTPTunnel.h>
 +#include <asn/ngap/ASN_NGAP_GlobalGNB-ID.h>
 +#include <asn/ngap/ASN_NGAP_HandoverCommand.h>
++#include <asn/ngap/ASN_NGAP_HandoverCommandTransfer.h>
 +#include <asn/ngap/ASN_NGAP_HandoverFailure.h>
 +#include <asn/ngap/ASN_NGAP_HandoverNotify.h>
 +#include <asn/ngap/ASN_NGAP_HandoverPreparationFailure.h>
@@ -189,6 +673,8 @@ index 0000000..f6447c7
 +#include <asn/ngap/ASN_NGAP_NR-CGI.h>
 +#include <asn/ngap/ASN_NGAP_PDUSessionResourceAdmittedItem.h>
 +#include <asn/ngap/ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceHandoverItem.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceHandoverList.h>
 +#include <asn/ngap/ASN_NGAP_PDUSessionResourceItemHORqd.h>
 +#include <asn/ngap/ASN_NGAP_PDUSessionResourceSetupItemHOReq.h>
 +#include <asn/ngap/ASN_NGAP_PDUSessionResourceSetupRequestTransfer.h>
@@ -242,8 +728,12 @@ index 0000000..f6447c7
 +static OctetString EncodeHandoverRequiredTransfer()
 +{
 +    auto *transfer = asn::New<ASN_NGAP_HandoverRequiredTransfer>();
-+    // directForwardingPathAvailability is intentionally absent: gNB-to-gNB data forwarding is not
-+    // implemented in this simulation (see the user plane notes in the delivery documentation).
++    // The source indicates that the direct forwarding path is available (TS 23.502 4.9.1.3.2 step 1).
++    // In this simulation both gNBs are always IP reachable from each other, therefore direct
++    // forwarding is considered available. The core network decides whether to use direct or indirect
++    // forwarding (the gNB side supports both, see the delivery documentation).
++    transfer->directForwardingPathAvailability = asn::New<ASN_NGAP_DirectForwardingPathAvailability_t>();
++    *transfer->directForwardingPathAvailability = ASN_NGAP_DirectForwardingPathAvailability_direct_path_available;
 +    OctetString encoded = ngap_encode::EncodeS(asn_DEF_ASN_NGAP_HandoverRequiredTransfer, transfer);
 +    asn::Free(asn_DEF_ASN_NGAP_HandoverRequiredTransfer, transfer);
 +    return encoded;
@@ -351,6 +841,11 @@ index 0000000..f6447c7
 +    uint64_t hoId = (static_cast<uint64_t>(utils::CurrentTimeMillis()) << 20) | (++m_hoIdCounter & 0xFFFFF);
 +    ue->hoId = hoId;
 +    ue->hoAsSource = true;
++
++    // TNGRELOCprep: started when the Handover Required is sent, stopped when the Handover Command
++    // is received (TS 38.413 8.4.1.2 / 9.6).
++    ue->hoPrepTimerActive = true;
++    setTimer(TIMER_ID_TNGRELOC_PREP_BASE + ueId, TNGRELOC_PREP_MS);
 +
 +    std::vector<ASN_NGAP_HandoverRequiredIEs *> ies;
 +
@@ -541,6 +1036,7 @@ index 0000000..f6447c7
 +    // PDU session resource allocation
 +    std::vector<PduSessionResource *> sessions;
 +    std::vector<int> admittedPsis;
++    std::vector<std::pair<int, uint32_t>> forwardingTeids;
 +    std::vector<ASN_NGAP_PDUSessionResourceAdmittedItem *> admittedList;
 +    std::vector<ASN_NGAP_PDUSessionResourceFailedToSetupItemHOAck *> failedList;
 +    int offeredCount = 0;
@@ -589,6 +1085,11 @@ index 0000000..f6447c7
 +            resource->downTunnel.address = utils::IpToOctetString(gtpIp);
 +            resource->downTunnel.teid = ++m_downlinkTeidCounter;
 +
++            // Allocate a dedicated DL forwarding endpoint. It is announced in the Handover Request
++            // Acknowledge Transfer and used by the source gNB (direct forwarding) or by the UPF
++            // (indirect forwarding) until the data path is switched to the target.
++            resource->forwardingTeid = ++m_forwardingTeidCounter;
++
 +            // Handover Request Acknowledge Transfer: DL N3 TNL information and admitted QoS flows
 +            auto *ackTransfer = asn::New<ASN_NGAP_HandoverRequestAcknowledgeTransfer>();
 +            auto &dlInfo = ackTransfer->dL_NGU_UP_TNLInformation;
@@ -596,6 +1097,13 @@ index 0000000..f6447c7
 +            dlInfo.choice.gTPTunnel = asn::New<ASN_NGAP_GTPTunnel>();
 +            asn::SetBitString(dlInfo.choice.gTPTunnel->transportLayerAddress, resource->downTunnel.address);
 +            asn::SetOctetString4(dlInfo.choice.gTPTunnel->gTP_TEID, (octet4)resource->downTunnel.teid);
++
++            auto *fwdInfo = asn::New<ASN_NGAP_UPTransportLayerInformation_t>();
++            fwdInfo->present = ASN_NGAP_UPTransportLayerInformation_PR_gTPTunnel;
++            fwdInfo->choice.gTPTunnel = asn::New<ASN_NGAP_GTPTunnel>();
++            asn::SetBitString(fwdInfo->choice.gTPTunnel->transportLayerAddress, resource->downTunnel.address);
++            asn::SetOctetString4(fwdInfo->choice.gTPTunnel->gTP_TEID, (octet4)resource->forwardingTeid);
++            ackTransfer->dLForwardingUP_TNLInformation = fwdInfo;
 +
 +            auto &qosList = resource->qosFlows->list;
 +            for (int q = 0; q < qosList.count; q++)
@@ -625,6 +1133,7 @@ index 0000000..f6447c7
 +            admittedList.push_back(admittedItem);
 +            sessions.push_back(resource);
 +            admittedPsis.push_back(resource->psi);
++            forwardingTeids.emplace_back(resource->psi, resource->forwardingTeid);
 +        }
 +    }
 +
@@ -723,6 +1232,16 @@ index 0000000..f6447c7
 +    sendNgapUeAssociated(provisionalUeId,
 +                         asn::ngap::NewMessagePdu<ASN_NGAP_HandoverRequestAcknowledge>(responseIes));
 +
++    // Register the announced DL forwarding endpoints so that data forwarded by the source gNB (or
++    // by the UPF in the indirect case) can be accepted and buffered until the UE arrives.
++    if (!forwardingTeids.empty())
++    {
++        auto wFwd = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::HANDOVER_FORWARDING_SETUP);
++        wFwd->hoSti = ueSti;
++        wFwd->hoForwardingTeids = std::move(forwardingTeids);
++        m_base->gtpTask->push(std::move(wFwd));
++    }
++
 +    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Target, ho::EventPhase::HoAckSent, hoId, ue,
 +                                            m_base->config->nci, admittedPsis));
 +}
@@ -753,6 +1272,19 @@ index 0000000..f6447c7
 +        ue->amfUeNgapId = idPair.amfUeNgapId.value();
 +    }
 +
++    if (!ue->hoPrepTimerActive)
++    {
++        m_logger->warn("N2 handover: no handover preparation pending for UE[%d], ignoring the Handover Command",
++                       ue->ctxId);
++        return;
++    }
++
++    // TNGRELOCprep stops and TNGRELOCoverall starts when the Handover Command is received
++    // (TS 38.413 8.4.1.2 / 9.6).
++    ue->hoPrepTimerActive = false;
++    ue->hoOverallTimerActive = true;
++    setTimer(TIMER_ID_TNGRELOC_OVERALL_BASE + ue->ctxId, TNGRELOC_OVERALL_MS);
++
 +    // Extract the RRC container (the simulated handover command) from the target-to-source container
 +    auto *ieContainer = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_TargetToSource_TransparentContainer);
 +    if (ieContainer == nullptr)
@@ -776,6 +1308,58 @@ index 0000000..f6447c7
 +    {
 +        m_logger->err("N2 handover: cannot extract the handover command payload");
 +        return;
++    }
++
++    // Data forwarding: parse the per-session DL forwarding transport layer information and arm the
++    // redirection before the UE is commanded to leave the source cell.
++    std::vector<std::pair<int, GtpTunnel>> forwardingTunnels;
++    auto *ieSessionList = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceHandoverList);
++    if (ieSessionList != nullptr)
++    {
++        auto &sessionList = ieSessionList->PDUSessionResourceHandoverList.list;
++        for (int i = 0; i < sessionList.count; i++)
++        {
++            auto *item = sessionList.array[i];
++            auto *transfer = ngap_encode::Decode<ASN_NGAP_HandoverCommandTransfer>(
++                asn_DEF_ASN_NGAP_HandoverCommandTransfer, item->handoverCommandTransfer);
++            if (transfer == nullptr)
++            {
++                m_logger->warn("N2 handover: PSI[%ld] handover command transfer could not be decoded",
++                               (long)item->pDUSessionID);
++                continue;
++            }
++
++            if (transfer->dLForwardingUP_TNLInformation != nullptr &&
++                transfer->dLForwardingUP_TNLInformation->present == ASN_NGAP_UPTransportLayerInformation_PR_gTPTunnel)
++            {
++                auto *tunnel = transfer->dLForwardingUP_TNLInformation->choice.gTPTunnel;
++                GtpTunnel info{};
++                info.teid = static_cast<uint32_t>(asn::GetOctet4(tunnel->gTP_TEID));
++                info.address = asn::GetOctetString(tunnel->transportLayerAddress);
++                m_logger->info("N2 handover: PSI[%ld] DL forwarding TNL received (teid[%u])", (long)item->pDUSessionID,
++                               info.teid);
++                forwardingTunnels.emplace_back(static_cast<int>(item->pDUSessionID), std::move(info));
++            }
++            else
++            {
++                m_logger->info("N2 handover: PSI[%ld] no DL forwarding TNL in the handover command",
++                               (long)item->pDUSessionID);
++            }
++
++            asn::Free(asn_DEF_ASN_NGAP_HandoverCommandTransfer, transfer);
++        }
++    }
++    else
++    {
++        m_logger->info("N2 handover: handover command without a PDU session handover list, data forwarding not started");
++    }
++
++    if (!forwardingTunnels.empty())
++    {
++        auto wFwd = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::HANDOVER_FORWARDING_START);
++        wFwd->ueId = ue->ctxId;
++        wFwd->hoForwardingTunnels = std::move(forwardingTunnels);
++        m_base->gtpTask->push(std::move(wFwd));
 +    }
 +
 +    auto w = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::HANDOVER);
@@ -858,6 +1442,17 @@ index 0000000..f6447c7
 +        ue->pduSessions.insert(resource->psi);
 +    }
 +
++    // Flush the data buffered on the announced forwarding endpoints and keep them registered as
++    // downlink aliases of the sessions (some core networks keep sending downlink data to the
++    // forwarding endpoint for the whole session lifetime). The flush message is processed after the
++    // session create messages above (NTS FIFO order).
++    {
++        auto wFlush = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::HANDOVER_FORWARDING_FLUSH);
++        wFlush->hoSti = sti;
++        wFlush->hoUeId = ueId;
++        m_base->gtpTask->push(std::move(wFlush));
++    }
++
 +    delete pending;
 +    m_pendingHandovers.erase(it);
 +
@@ -896,6 +1491,9 @@ index 0000000..f6447c7
 +    if (ue == nullptr && idPair.amfUeNgapId.has_value())
 +        ue = findUeByAmfId(idPair.amfUeNgapId.value());
 +
++    if (ue != nullptr)
++        ue->hoPrepTimerActive = false;
++
 +    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Source, ho::EventPhase::HoPrepFailure,
 +                                            ue != nullptr ? ue->hoId : 0, ue, m_base->config->nci, SessionsOf(ue)));
 +}
@@ -908,6 +1506,11 @@ index 0000000..f6447c7
 +
 +    auto *pending = it->second;
 +    m_logger->warn("N2 handover: cancelling pending handover for sti[%llu] (%s)", (unsigned long long)ueSti, reason);
++
++    // Release the forwarding endpoints announced for this preparation
++    auto wFwd = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::HANDOVER_FORWARDING_TEARDOWN);
++    wFwd->hoSti = ueSti;
++    m_base->gtpTask->push(std::move(wFwd));
 +
 +    deleteUeContext(pending->provisionalUeId);
 +    for (auto *session : pending->sessions)
@@ -929,6 +1532,52 @@ index 0000000..f6447c7
 +
 +    for (auto sti : expired)
 +        cancelPendingHandover(sti, "timed out while waiting for the UE on the target cell");
++}
++
++void NgapTask::handleTngRelocPrepTimeout(int ueId)
++{
++    // The timer cannot be cancelled: after a completed handover (or a released UE context) the
++    // expiry is simply ignored. A direct lookup is used to avoid a spurious "context not found" log.
++    auto it = m_ueCtx.find(ueId);
++    if (it == m_ueCtx.end())
++        return;
++
++    auto *ue = it->second;
++    if (ue == nullptr || !ue->hoPrepTimerActive)
++        return;
++
++    ue->hoPrepTimerActive = false;
++    ue->hoId = 0;
++
++    m_logger->warn("N2 handover: TNGRELOCprep expired for UE[%d], aborting the handover preparation (a late "
++                   "Handover Command or Preparation Failure is ignored; Handover Cancel is not implemented in "
++                   "this simulation)",
++                   ueId);
++}
++
++void NgapTask::handleTngRelocOverallTimeout(int ueId)
++{
++    auto it = m_ueCtx.find(ueId);
++    if (it == m_ueCtx.end())
++        return;
++
++    auto *ue = it->second;
++    if (ue == nullptr || !ue->hoOverallTimerActive)
++        return;
++
++    ue->hoOverallTimerActive = false;
++
++    m_logger->warn("N2 handover: TNGRELOCoverall expired for UE[%d], stopping data forwarding and requesting the "
++                   "release of the UE context",
++                   ueId);
++
++    // Stop the source-side data forwarding immediately: the release may never arrive.
++    auto wFwd = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::HANDOVER_FORWARDING_STOP);
++    wFwd->ueId = ueId;
++    m_base->gtpTask->push(std::move(wFwd));
++
++    // TS 38.413 8.3.3: the source NG-RAN node requests the AMF to release the UE context.
++    sendContextRelease(ueId, NgapCause::RadioNetwork_unspecified);
 +}
 +
 +} // namespace nr::gnb
@@ -973,7 +1622,7 @@ index 6bd6beb..58a89c2 100644
      auto *ueCtx = findUeContext(ueId);
      if (ueCtx == nullptr)
 diff --git a/src/gnb/ngap/task.cpp b/src/gnb/ngap/task.cpp
-index b0abae9..a942dd5 100644
+index b0abae9..be04987 100644
 --- a/src/gnb/ngap/task.cpp
 +++ b/src/gnb/ngap/task.cpp
 @@ -28,6 +28,8 @@ void NgapTask::onStart()
@@ -994,7 +1643,7 @@ index b0abae9..a942dd5 100644
              break;
          }
          case NmGnbRrcToNgap::UPLINK_NAS_DELIVERY: {
-@@ -66,6 +68,19 @@ void NgapTask::onLoop()
+@@ -66,6 +68,27 @@ void NgapTask::onLoop()
              handleRadioLinkFailure(w.ueId);
              break;
          }
@@ -1011,11 +1660,19 @@ index b0abae9..a942dd5 100644
 +        {
 +            setTimer(TIMER_ID_HANDOVER_CLEANUP, 5000);
 +            cleanupPendingHandovers();
++        }
++        else if (w.timerId >= TIMER_ID_TNGRELOC_PREP_BASE && w.timerId < TIMER_ID_TNGRELOC_PREP_BASE + 1000)
++        {
++            handleTngRelocPrepTimeout(w.timerId - TIMER_ID_TNGRELOC_PREP_BASE);
++        }
++        else if (w.timerId >= TIMER_ID_TNGRELOC_OVERALL_BASE && w.timerId < TIMER_ID_TNGRELOC_OVERALL_BASE + 1000)
++        {
++            handleTngRelocOverallTimeout(w.timerId - TIMER_ID_TNGRELOC_OVERALL_BASE);
          }
          break;
      }
 diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
-index 14ea956..1d5f33a 100644
+index 14ea956..1da9de9 100644
 --- a/src/gnb/ngap/task.hpp
 +++ b/src/gnb/ngap/task.hpp
 @@ -8,8 +8,10 @@
@@ -1040,8 +1697,11 @@ index 14ea956..1d5f33a 100644
  }
  
  namespace nr::gnb
-@@ -56,6 +62,27 @@ class NgapTask : public NtsTask
+@@ -54,8 +60,37 @@ class NgapTask : public NtsTask
+     std::unordered_map<int, NgapUeContext *> m_ueCtx;
+     int64_t m_ueNgapIdCounter;
      uint32_t m_downlinkTeidCounter;
++    uint32_t m_forwardingTeidCounter{0x80000000u};
      bool m_isInitialized;
  
 +    /* N2 handover: prepared (but not yet accessed) target-side handover state, keyed by the
@@ -1065,10 +1725,17 @@ index 14ea956..1d5f33a 100644
 +
 +    static constexpr int TIMER_ID_HANDOVER_CLEANUP = 101;
 +
++    /* TNGRELOCprep / TNGRELOCoverall (TS 38.413 9.6). The timer ids are per-UE: base + UE context
++     * id. The simulation allocates small positive context ids, so the ranges do not overlap. */
++    static constexpr int TIMER_ID_TNGRELOC_PREP_BASE = 1000;
++    static constexpr int TIMER_ID_TNGRELOC_OVERALL_BASE = 3000;
++    static constexpr int64_t TNGRELOC_PREP_MS = 5000;
++    static constexpr int64_t TNGRELOC_OVERALL_MS = 10000;
++
      friend class GnbCmdHandler;
  
    public:
-@@ -71,7 +98,7 @@ class NgapTask : public NtsTask
+@@ -71,7 +106,7 @@ class NgapTask : public NtsTask
      /* Utility functions */
      void createAmfContext(const GnbAmfConfig &config);
      NgapAmfContext *findAmfContext(int ctxId);
@@ -1077,7 +1744,7 @@ index 14ea956..1d5f33a 100644
      NgapUeContext *findUeContext(int ctxId);
      NgapUeContext *findUeByRanId(int64_t ranUeNgapId);
      NgapUeContext *findUeByAmfId(int64_t amfUeNgapId);
-@@ -99,7 +126,7 @@ class NgapTask : public NtsTask
+@@ -99,7 +134,7 @@ class NgapTask : public NtsTask
  
      /* NAS transport */
      void handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t rrcEstablishmentCause,
@@ -1086,7 +1753,7 @@ index 14ea956..1d5f33a 100644
      void handleUplinkNasTransport(int ueId, const OctetString &nasPdu);
      void receiveDownlinkNasTransport(int amfId, ASN_NGAP_DownlinkNASTransport *msg);
      void deliverDownlinkNas(int ueId, OctetString &&nasPdu);
-@@ -124,6 +151,16 @@ class NgapTask : public NtsTask
+@@ -124,6 +159,18 @@ class NgapTask : public NtsTask
      /* Radio resource control */
      void handleRadioLinkFailure(int ueId);
      void receivePaging(int amfId, ASN_NGAP_Paging *msg);
@@ -1100,6 +1767,8 @@ index 14ea956..1d5f33a 100644
 +    void receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg);
 +    void cancelPendingHandover(uint64_t ueSti, const char *reason);
 +    void cleanupPendingHandovers();
++    void handleTngRelocPrepTimeout(int ueId);
++    void handleTngRelocOverallTimeout(int ueId);
  };
  
  } // namespace nr::gnb
@@ -1153,10 +1822,20 @@ index 46c5862..81b11bf 100644
          asn::ngap::FindProtocolIeInPdu(pdu, asn_DEF_ASN_NGAP_UE_NGAP_IDs, ASN_NGAP_ProtocolIE_ID_id_UE_NGAP_IDs);
      if (ptr != nullptr)
 diff --git a/src/gnb/nts.hpp b/src/gnb/nts.hpp
-index ae328ee..8d3e699 100644
+index ae328ee..5278a09 100644
 --- a/src/gnb/nts.hpp
 +++ b/src/gnb/nts.hpp
-@@ -44,6 +44,10 @@ struct NmGnbRlsToRrc : NtsMessage
+@@ -10,7 +10,9 @@
+ 
+ #include "types.hpp"
+ 
++#include <cstdint>
+ #include <utility>
++#include <vector>
+ 
+ #include <lib/app/cli_base.hpp>
+ #include <lib/app/cli_cmd.hpp>
+@@ -44,6 +46,10 @@ struct NmGnbRlsToRrc : NtsMessage
      // UPLINK_RRC
      int ueId{};
  
@@ -1167,7 +1846,7 @@ index ae328ee..8d3e699 100644
      // UPLINK_RRC
      OctetString data;
      rrc::RrcChannel rrcChannel{};
-@@ -110,6 +114,10 @@ struct NmGnbRlsToRls : NtsMessage
+@@ -110,6 +116,10 @@ struct NmGnbRlsToRls : NtsMessage
      // UPLINK_RRC
      int ueId{};
  
@@ -1178,7 +1857,7 @@ index ae328ee..8d3e699 100644
      // RECEIVE_RLS_MESSAGE
      std::unique_ptr<rls::RlsMessage> msg{};
  
-@@ -166,15 +174,21 @@ struct NmGnbNgapToRrc : NtsMessage
+@@ -166,15 +176,21 @@ struct NmGnbNgapToRrc : NtsMessage
          NAS_DELIVERY,
          AN_RELEASE,
          PAGING,
@@ -1200,7 +1879,7 @@ index ae328ee..8d3e699 100644
      // PAGING
      asn::Unique<ASN_NGAP_FiveG_S_TMSI> uePagingTmsi{};
      asn::Unique<ASN_NGAP_TAIListForPaging> taiListForPaging{};
-@@ -190,12 +204,14 @@ struct NmGnbRrcToNgap : NtsMessage
+@@ -190,12 +206,14 @@ struct NmGnbRrcToNgap : NtsMessage
      {
          INITIAL_NAS_DELIVERY,
          UPLINK_NAS_DELIVERY,
@@ -1216,7 +1895,7 @@ index ae328ee..8d3e699 100644
      int ueId{};
  
      // INITIAL_NAS_DELIVERY
-@@ -206,6 +222,10 @@ struct NmGnbRrcToNgap : NtsMessage
+@@ -206,6 +224,10 @@ struct NmGnbRrcToNgap : NtsMessage
      int64_t rrcEstablishmentCause{};
      std::optional<GutiMobileIdentity> sTmsi{};
  
@@ -1225,6 +1904,38 @@ index ae328ee..8d3e699 100644
 +    uint64_t sti{};
 +
      explicit NmGnbRrcToNgap(PR present) : NtsMessage(NtsMessageType::GNB_RRC_TO_NGAP), present(present)
+     {
+     }
+@@ -219,6 +241,11 @@ struct NmGnbNgapToGtp : NtsMessage
+         UE_CONTEXT_RELEASE,
+         SESSION_CREATE,
+         SESSION_RELEASE,
++        HANDOVER_FORWARDING_SETUP,
++        HANDOVER_FORWARDING_START,
++        HANDOVER_FORWARDING_FLUSH,
++        HANDOVER_FORWARDING_STOP,
++        HANDOVER_FORWARDING_TEARDOWN,
+     } present;
+ 
+     // UE_CONTEXT_UPDATE
+@@ -234,6 +261,19 @@ struct NmGnbNgapToGtp : NtsMessage
+     // SESSION_RELEASE
+     int psi{};
+ 
++    // N2 handover data forwarding (see the delivery documentation).
++    // HANDOVER_FORWARDING_SETUP / FLUSH / TEARDOWN: simulated radio identity (RLS STI) of the UE.
++    uint64_t hoSti{};
++
++    // HANDOVER_FORWARDING_SETUP: PSI -> DL forwarding TEID announced by this (target) node.
++    std::vector<std::pair<int, uint32_t>> hoForwardingTeids{};
++
++    // HANDOVER_FORWARDING_START: PSI -> DL forwarding transport layer information (source side).
++    std::vector<std::pair<int, GtpTunnel>> hoForwardingTunnels{};
++
++    // HANDOVER_FORWARDING_FLUSH: the final UE context id on the target cell.
++    int hoUeId{};
++
+     explicit NmGnbNgapToGtp(PR present) : NtsMessage(NtsMessageType::GNB_NGAP_TO_GTP), present(present)
      {
      }
 diff --git a/src/gnb/rls/ctl_task.cpp b/src/gnb/rls/ctl_task.cpp
@@ -1494,20 +2205,22 @@ index 9da8eb3..0bfc262 100644
      void sendRrcMessage(ASN_RRC_BCCH_BCH_Message *msg);
      void sendRrcMessage(ASN_RRC_BCCH_DL_SCH_Message *msg);
 diff --git a/src/gnb/types.hpp b/src/gnb/types.hpp
-index 042adb8..2443033 100644
+index 042adb8..96c464f 100644
 --- a/src/gnb/types.hpp
 +++ b/src/gnb/types.hpp
-@@ -135,6 +135,9 @@ struct NgapUeContext
+@@ -135,6 +135,11 @@ struct NgapUeContext
      int downlinkStream{};
      AggregateMaximumBitRate ueAmbr{};
      std::set<int> pduSessions{};
 +    uint64_t sti{};        // simulated radio identity (RLS STI) of the UE
 +    uint64_t hoId{};       // correlation id of the last/ongoing handover (0 if none)
 +    bool hoAsSource = true; // role played in that handover (event logging only)
++    bool hoPrepTimerActive = false;    // TNGRELOCprep running (source side, TS 38.413 9.6)
++    bool hoOverallTimerActive = false; // TNGRELOCoverall running (source side, TS 38.413 9.6)
  
      explicit NgapUeContext(int ctxId) : ctxId(ctxId)
      {
-@@ -149,6 +152,7 @@ struct RrcUeContext
+@@ -149,6 +154,7 @@ struct RrcUeContext
      bool isInitialIdSTmsi{}; // TMSI-part-1 or a random value
      int64_t establishmentCause{};
      std::optional<GutiMobileIdentity> sTmsi{};
@@ -1515,6 +2228,14 @@ index 042adb8..2443033 100644
  
      explicit RrcUeContext(const int ueId) : ueId(ueId)
      {
+@@ -260,6 +266,7 @@ struct PduSessionResource
+     PduSessionType sessionType = PduSessionType::UNSTRUCTURED;
+     GtpTunnel upTunnel{};
+     GtpTunnel downTunnel{};
++    uint32_t forwardingTeid{}; // DL forwarding endpoint announced during a handover (0 if none)
+     asn::Unique<ASN_NGAP_QosFlowSetupRequestList> qosFlows{};
+ 
+     PduSessionResource(const int ueId, const int psi) : ueId(ueId), psi(psi)
 diff --git a/src/lib/app/cli_cmd.cpp b/src/lib/app/cli_cmd.cpp
 index ca6325e..4005171 100644
 --- a/src/lib/app/cli_cmd.cpp
@@ -2404,10 +3125,10 @@ index 33f91a7..9f54535 100644
  } // namespace nr::ue
 diff --git a/tests/handover/CMakeLists.txt b/tests/handover/CMakeLists.txt
 new file mode 100644
-index 0000000..da0025e
+index 0000000..48e207c
 --- /dev/null
 +++ b/tests/handover/CMakeLists.txt
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +# N2 handover unit tests (self-contained, no external test framework).
 +#
 +# The test lives in its own subdirectory so that this delivery can coexist with other test
@@ -2417,6 +3138,7 @@ index 0000000..da0025e
 +  ho_tests.cpp
 +  ../../src/lib/ho/ho.cpp
 +  ../../src/lib/ho/events.cpp
++  ../../src/gnb/gtp/forwarding.cpp
 +  ../../src/utils/octet_string.cpp
 +  ../../src/utils/common.cpp
 +)
@@ -2427,10 +3149,10 @@ index 0000000..da0025e
 +add_test(NAME ho-tests COMMAND ho-tests)
 diff --git a/tests/handover/ho_tests.cpp b/tests/handover/ho_tests.cpp
 new file mode 100644
-index 0000000..087c96e
+index 0000000..e24889c
 --- /dev/null
 +++ b/tests/handover/ho_tests.cpp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,179 @@
 +// Plain-assert unit tests for the N2 handover pure functions.
 +//
 +// Covers the simulation container codec (lib/ho) and the deterministic cell ranking used by
@@ -2442,6 +3164,7 @@ index 0000000..087c96e
 +#include <utility>
 +#include <vector>
 +
++#include <gnb/gtp/forwarding.hpp>
 +#include <lib/ho/events.hpp>
 +#include <lib/ho/ho.hpp>
 +
@@ -2560,6 +3283,44 @@ index 0000000..087c96e
 +        CHECK(s.find("\"role\":\"source\"") != std::string::npos, "event role serialized");
 +        CHECK(s.find("\"sessions\":[1,2]") != std::string::npos, "event sessions serialized");
 +        CHECK(s.find("gnb\\\"x") != std::string::npos, "event node name escaped");
++    }
++
++    // ---------- Handover data forwarding: bounded buffer ----------
++    {
++        auto make = [](int len, uint8_t fill) {
++            OctetString s;
++            for (int i = 0; i < len; i++)
++                s.appendOctet(fill);
++            return s;
++        };
++
++        nr::gnb::ForwardingBuffer buffer;
++        CHECK(buffer.empty() && buffer.size() == 0 && buffer.bytes() == 0, "forwarding buffer starts empty");
++
++        buffer.push(make(10, 0x01));
++        buffer.push(make(20, 0x02));
++        CHECK(buffer.size() == 2 && buffer.bytes() == 30, "forwarding buffer counts packets and bytes");
++
++        auto first = buffer.pop();
++        CHECK(first.length() == 10 && first.get(0) == 0x01, "forwarding buffer preserves FIFO order");
++        CHECK(buffer.size() == 1 && buffer.bytes() == 20, "forwarding buffer updates counters on pop");
++
++        nr::gnb::ForwardingBuffer limited;
++        for (std::size_t i = 0; i < nr::gnb::ForwardingBuffer::MAX_PACKETS + 5; i++)
++            limited.push(make(1, static_cast<uint8_t>(i)));
++        CHECK(limited.size() == nr::gnb::ForwardingBuffer::MAX_PACKETS && limited.dropped() == 5,
++              "forwarding buffer drops oldest packets beyond the packet limit");
++        CHECK(limited.pop().get(0) == 5, "forwarding buffer keeps the newest packets after a drop");
++
++        nr::gnb::ForwardingBuffer byteLimited;
++        byteLimited.push(make(1024, 0xAA));
++        byteLimited.push(make(static_cast<int>(nr::gnb::ForwardingBuffer::MAX_BYTES), 0xBB));
++        CHECK(byteLimited.size() == 1 && byteLimited.dropped() == 1,
++              "forwarding buffer drops oldest packets beyond the byte limit");
++
++        nr::gnb::ForwardingBuffer emptyBuffer;
++        CHECK(emptyBuffer.pop().length() == 0 && emptyBuffer.dropped() == 0,
++              "forwarding buffer pop on empty is a no-op");
 +    }
 +
 +    if (g_failures == 0)

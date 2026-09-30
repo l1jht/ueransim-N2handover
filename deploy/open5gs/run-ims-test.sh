@@ -168,6 +168,10 @@ for k in $(seq 1 "$TOTAL"); do
     fi
     AFTER=$(ue_ids_sorted "$TGT")
     NEW_ID=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") | tr '\n' ' ' | sed 's/ *$//')
+    # The set difference is empty when the target re-uses the same local ue-id (observed on free5GC);
+    # the target gNB log is authoritative for the id the UE received on the target cell.
+    LOG_ID=$(docker logs --since "${WAIT}s" "$TGT" 2>&1 | grep -a "appeared on the target cell" | tail -1 | sed -n 's/.*UE\[\(-\?[0-9][0-9]*\)\] appeared.*/\1/p')
+    if [ -n "$LOG_ID" ]; then NEW_ID="$LOG_ID"; fi
     echo "$CUR_GNB->$TGT ue-id=$CUR_ID new-id-on-target='$NEW_ID' call=$ST" >> "$RESULTS/handovers.txt"
     if [ "$ST" = "LOST" ]; then
         echo "  call LOST after handover $k"; ims_status "$UE1" "$IMSI1" | grep -E "callState|error"; break

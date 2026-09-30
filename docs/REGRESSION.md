@@ -12,7 +12,7 @@
 
 | # | 场景 | 结果 |
 |---|---|---|
-| A1 | 干净 v3.3.0 apply `n2handover.patch` → 构建 → `ctest` | ✅ 构建成功；`ho-tests` 1/1（14 项断言） |
+| A1 | 干净 v3.3.0 apply `n2handover.patch` → 构建 → `ctest` | ✅ 构建成功；`ho-tests` 1/1（23 项断言，v2 起含转发缓冲 9 项） |
 | A2 | `ims.patch` → `n2handover.patch` → 构建 → `ctest` | ✅ 2/2（`ims-tests` + `ho-tests`） |
 | A3 | `n2handover.patch` → `ims.patch` → 构建 → `ctest` | ✅ 2/2 |
 | A4 | 补丁与已提交代码一致性（`git diff` 对比补丁文件） | ✅ 哈希一致 |
@@ -115,3 +115,25 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 - 补丁**未引入对既有功能的回归**（含基线对照验证）；
 - N2 切换的正常路径（单 UE / 多 UE / 多 PDU 会话 / 反复切换）与失败路径（Preparation Failure）均按规范行为工作；
 - 观察 1–5 已记录，其中 1 为上游限制（有基线证据）、2 为 5GC 侧竞态、3–5 为已知简化的自然表现。
+
+## 8. v2 数据转发回归（2026-10-01）
+
+**包级（干净 v3.3.0，三个场景重跑）**：仅 n2 / ims→n2 / n2→ims 均 apply + 构建通过；ctest 1/1、2/2、2/2；补丁 3334 行（v1 2573）。
+
+**功能级（两核 IMS 通话中切换，各 10 次往返 / 20 次切换）**：
+
+| 指标 | free5GC | Open5GS |
+|---|---|---|
+| 通话保持 | 20/20 CONFIRMED | 20/20 CONFIRMED |
+| RTP 缺口 max（ue1 DL / UL） | 40.8 / 41.2 ms | 40.3 / 40.9 ms |
+| >60 ms 中断 | 0 | 0 |
+| UE 侧 mediaTx/mediaRx 差（ue1） | 3 包 | 0 包 |
+| 源侧转发计数（每次切换，IMS 会话） | 10–11 包 | 9–10 包 |
+| 未知 TEID / 定时器噪声 | 0 | 0 |
+| 控制面（prep / release） | 22–30 / 210–222 ms | 11–13 / 500–508 ms |
+
+- v1 归档对照（同口径）：RTP max 40.9/41.2（Open5GS）、41.0/40.6（free5GC），>60 ms 中断 0 —— v2 无回归；
+- 转发功能证据：源 `data forwarding started/active(QFI)/stopped(N packets)`、目标 `endpoint registered/flushed/alias`、两核均无 `TEID not found`；
+- 证据：`deploy/open5gs/evidence/ims-handover-summary-v2-forwarding.txt`、`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v2-forwarding.txt`。
+
+**新增观察（free5GC 运维）**：中断的切换流程（例如对错误 ue-id 触发）会令 AMF 残留 `N2 handover is ongoing`，随后该 UE 的注册被拒（`Registration Reject [CONGESTION]`）；重启 `amf/smf/upf` 并重连 gNB/UE 恢复。另：验收脚本的 ue-id 跟踪已从"目标列表差分"改为**目标 gNB 日志权威 id**（free5GC 下 id 会复用，差分失效）。

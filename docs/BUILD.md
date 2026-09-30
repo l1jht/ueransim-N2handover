@@ -67,6 +67,8 @@ docker run --rm -v "$PWD":/work -w /work/UERANSIM --user $(id -u):$(id -g) ueran
 | `ims.patch` → `n2handover.patch` | ✅ | ✅ | `ims-tests` + `ho-tests` 2/2 通过 |
 | `n2handover.patch` → `ims.patch` | ✅ | ✅ | 2/2 通过 |
 
+> v2（2026-10-01）同一矩阵重跑通过（补丁 3334 行；`ho-tests` 23 项断言）。
+
 宿主机依赖（Ubuntu 22.04）：`sudo apt install cmake libsctp-dev`（libsctp 头文件位于 `/usr/include/netinet/sctp.h`）。
 
 ## 6. 常见问题
