@@ -44,7 +44,7 @@
 | `gnb1.yaml` / `gnb2.yaml` | 两个 gNB 配置（gNB ID 1/2，NCI `0x10`/`0x20`） |
 | `ue1.yaml` / `ue2.yaml` | 两个 UE 配置（双 PDU 会话 internet+ims，IMS 客户端端口 5061/5062、媒体端口 50002/50003） |
 | `provision.sh` | 开户脚本：Open5GS HSS（`open5gs-dbctl`）+ pyHSS（REST） |
-| `run-ims-test.sh` | **验收脚本**：起 UE → 建立通话 → rtpengine 侧抓 RTP → 双向 N2 切换 → 缺口分析 + 事件相关性 |
+| `run-ims-test.sh` | **验收脚本**（v3）：起 UE → 建立通话 → rtpengine 侧按媒体端口抓 RTP → `-n` 次往返 N2 切换 → 逐次缺口分析 + 控制面耗时 + 事件相关性（同一脚本也用于 free5GC 运行：`../free5gc-ims/README.md`） |
 | `tweaks/apply-open5gs-tweaks.sh` | 对 docker_open5gs 仓库应用 3 处环境适配（见第 4 节） |
 
 ---

@@ -262,4 +262,38 @@ target: HO_REQUEST_RECEIVED → HO_ACK_SENT → RRC_RECFG_COMPLETE_RECEIVED → 
 - Open5GS 与 free5GC 的 N2 切换流程（`docs/RUN.md` §5）**完全一致**；本节未发现任何 Open5GS 特有的实现差异
   （AMF 同样在路径切换后释放源侧、目标侧采用新分配的 AMF-UE-NGAP-ID，本实现按 RAN-UE-NGAP-ID 匹配）。
 
+## 11. free5GC + IMS 实测记录（方案 L，与 Open5GS 对比）
+
+> 环境：free5GC v4.2.3（精简服务集 `db nrf amf ausf udm udr smf upf pcf webui` + **`nssf`**）
+> + docker_open5gs IMS 组件栈（`10.100.200.41–48`，P-CSCF `.47`），PLMN 001/01；
+> UERANSIM（n2handover+ims 合并构建）两 gNB 两 UE；**N5/RX 关闭**（验收不需要 QoS 授权）。
+> 资产与步骤：`deploy/free5gc-ims/README.md`；执行脚本共用 `deploy/open5gs/run-ims-test.sh`（v3）。
+
+### 11.1 结果（10 次往返 = 20 次切换，与 Open5GS 基线同协议）
+
+| 指标 | free5GC | Open5GS 基线 |
+|---|---|---|
+| 切换 / 通话保持 | **20 / 20 `CONFIRMED`** | 20 / 20 `CONFIRMED` |
+| RTP 缺口 max（ue1 DL / UL） | **41.0 / 40.6 ms** | 40.9 / 41.2 ms |
+| RTP 缺口 max（ue2 对照 DL / UL） | 40.6 / 40.9 ms | 41.3 / 40.9 ms |
+| >60 ms 中断 | **0** | 0 |
+| prep（`REQ→REQ_RECV`） | 21–27 ms | 11–13 ms |
+| 空口重配 / 执行 | 0–1 ms / 0–1 ms | 0–1 ms / 0–1 ms |
+| 源侧释放（`NOTIFY→CTX_REL`） | 207–219 ms | 501–508 ms |
+
+证据：`deploy/free5gc-ims/evidence/{free5gc-ims-handover-summary.txt, free5gc-handovers.csv,
+free5gc-rtp.txt.gz, compare-open5gs-free5gc.txt}`。
+
+**结论**：业务连续性在两套独立核心网上**等价**（无 >60 ms 中断）；控制面时序差异属两套 AMF/SMF
+实现行为（free5GC 准备往返约 2×、源侧释放约 2.4× 更快），与 N2 切换实现（本补丁）无关。
+
+### 11.2 复现要点与坑（详见 `deploy/free5gc-ims/README.md` §5）
+
+1. free5GC 需带 **`nssf`**（AMF 选 SMF 要经 NRF 查 NSSF），否则 PDU 会话请求持续 T3580 重传；
+2. **不要带着曾重传的会话进入测试**：重复建立会触发 `Cause_REL_DUE_TO_DUPLICATE_SESSION_ID`
+   → UPF 规则被拆除（现象：IMS REGISTER 到不了 P-CSCF）→ **重启 UE** 即可干净恢复；
+3. UPF MASQUERADE 下按**媒体端口**（50002/50003）抓包/分类（脚本 v3 已实现，NAT/非 NAT 通用；
+   Open5GS 基线已同口径重析，结果与 v2 一致）；
+4. ePCO 正常下发（`pcscf=10.100.200.47 (EPCO)`）；UE 配置中的静态 `ims.pcscf` 仅兜底。
+
 

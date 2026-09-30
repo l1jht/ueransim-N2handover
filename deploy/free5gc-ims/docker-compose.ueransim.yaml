@@ -1,0 +1,80 @@
+# UERANSIM containers for the free5GC + IMS testbed (Plan L): two gNBs, two UEs.
+#
+# Usage (from the free5GC compose directory, e.g. the `f5gc-ims-run` copy):
+#   cp -r <deliver>/deploy/free5gc-ims/{gnb1,gnb2,ue1,ue2}.yaml config/  (renamed ims-*.yaml, see below)
+#   export UERANSIM_BUILD_DIR=/path/to/UERANSIM/build      # n2handover (+ims) build
+#   docker compose -f docker-compose.yaml -f docker-compose.ueransim.yaml up -d \
+#       db free5gc-nrf free5gc-amf free5gc-ausf free5gc-udm free5gc-udr free5gc-smf \
+#       free5gc-upf free5gc-pcf free5gc-webui gnb1 gnb2 ue1
+#   # ue2 is started later by run-ims-test.sh --start (after ue1's ue-id was noted)
+#
+# Static addresses are high in the subnet (docker allocates dynamic addresses from the
+# low end). Keep them distinct from the free5GC services and the IMS containers.
+services:
+  gnb1:
+    container_name: gnb1
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb1.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/ims-gnb1.yaml:/ueransim/config/gnb1.yaml:ro
+      - ./ho-events/gnb1:/ueransim/logs
+    cap_add:
+      - NET_ADMIN
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.131
+    depends_on:
+      - free5gc-amf
+      - free5gc-upf
+
+  gnb2:
+    container_name: gnb2
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-gnb -c /ueransim/config/gnb2.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/ims-gnb2.yaml:/ueransim/config/gnb2.yaml:ro
+      - ./ho-events/gnb2:/ueransim/logs
+    cap_add:
+      - NET_ADMIN
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.132
+    depends_on:
+      - free5gc-amf
+      - free5gc-upf
+
+  ue1:
+    container_name: ue1
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-ue -c /ueransim/config/ue1.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/ims-ue1.yaml:/ueransim/config/ue1.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun"
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.133
+
+  ue2:
+    container_name: ue2
+    image: ${UERANSIM_IMAGE:-ueransim-build:22.04}
+    working_dir: /ueransim
+    command: /ueransim/bin/nr-ue -c /ueransim/config/ue2.yaml
+    volumes:
+      - ${UERANSIM_BUILD_DIR:?set UERANSIM_BUILD_DIR}:/ueransim/bin:ro
+      - ./config/ims-ue2.yaml:/ueransim/config/ue2.yaml:ro
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun"
+    networks:
+      privnet:
+        ipv4_address: 10.100.200.134

@@ -1,0 +1,189 @@
+# IMS components (docker_open5gs) attached to the free5GC compose network (Plan L).
+#
+# Usage (from the docker_open5gs checkout whose .env was prepared for free5GC):
+#   F5GC_NETWORK=<free5GC project>_privnet docker compose -f docker-compose.ims.yaml up -d \
+#       dns rtpengine mysql pyhss icscf scscf pcscf smsc
+#
+# Notes:
+#   - N5/RX are disabled by the tweaks script: the P-CSCF runs stand-alone and the UEs
+#     use plain UDP SIP; no SCP/PCF interaction (avoids free5GC's PDU Session Resource
+#     Modify path, which UERANSIM does not implement).
+#   - The pcscf/rtpengine init scripts add "ip route <UE_IPV4_IMS> via ${UPF_IP}" so that
+#     MT SIP/RTP towards the UEs goes through the free5GC UPF.
+networks:
+  privnet:
+    name: ${F5GC_NETWORK:?set F5GC_NETWORK (e.g. f5gc-ims-run_privnet)}
+    external: true
+
+services:
+  dns:
+    image: docker_dns
+    container_name: dns
+    env_file:
+      - ./.env
+    volumes:
+      - ./dns:/mnt/dns
+      - /etc/localtime:/etc/localtime:ro
+    expose:
+      - "53/udp"
+    networks:
+      privnet:
+        ipv4_address: ${DNS_IP}
+
+  rtpengine:
+    image: docker_rtpengine
+    container_name: rtpengine
+    privileged: true
+    env_file:
+      - ./.env
+    volumes:
+      - ./rtpengine:/mnt/rtpengine
+      - /etc/localtime:/etc/localtime:ro
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TABLE=0
+      - INTERFACE=${RTPENGINE_IP}
+      - LISTEN_NG=${RTPENGINE_IP}:2223
+      - PIDFILE=/run/ngcp-rtpengine-daemon.pid
+      - PORT_MAX=50000
+      - PORT_MIN=49000
+      - NO_FALLBACK=no
+      - TOS=184
+    expose:
+      - "2223/udp"
+    networks:
+      privnet:
+        ipv4_address: ${RTPENGINE_IP}
+
+  mysql:
+    image: docker_mysql
+    container_name: mysql
+    env_file:
+      - ./.env
+    volumes:
+      - ims_dbdata:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+    expose:
+      - "3306/tcp"
+    networks:
+      privnet:
+        ipv4_address: ${MYSQL_IP}
+
+  pyhss:
+    image: docker_pyhss
+    container_name: pyhss
+    dns: ${DNS_IP}
+    volumes:
+      - ./pyhss:/mnt/pyhss
+      - ./pyhss/logs:/pyhss/log/
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - ./.env
+    depends_on:
+      - dns
+      - mysql
+    expose:
+      - "${PYHSS_BIND_PORT}/tcp"
+      - "8080/tcp"
+    ports:
+      - "8080:8080/tcp"
+    networks:
+      privnet:
+        ipv4_address: ${PYHSS_IP}
+
+  icscf:
+    image: docker_kamailio
+    container_name: icscf
+    dns: ${DNS_IP}
+    volumes:
+      - ./icscf:/mnt/icscf
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - ./.env
+    environment:
+      - COMPONENT_NAME=icscf
+    depends_on:
+      - dns
+      - mysql
+      - pyhss
+    expose:
+      - "4060/udp"
+      - "4060/tcp"
+    networks:
+      privnet:
+        ipv4_address: ${ICSCF_IP}
+
+  scscf:
+    image: docker_kamailio
+    container_name: scscf
+    dns: ${DNS_IP}
+    volumes:
+      - ./scscf:/mnt/scscf
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - ./.env
+    environment:
+      - COMPONENT_NAME=scscf
+    depends_on:
+      - dns
+      - mysql
+      - pyhss
+    expose:
+      - "6060/udp"
+      - "6060/tcp"
+    networks:
+      privnet:
+        ipv4_address: ${SCSCF_IP}
+
+  pcscf:
+    image: docker_kamailio
+    container_name: pcscf
+    dns: ${DNS_IP}
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./pcscf:/mnt/pcscf
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - ./.env
+    environment:
+      - COMPONENT_NAME=pcscf
+      - DEPLOY_MODE=5G
+    depends_on:
+      - dns
+      - mysql
+      - rtpengine
+      - icscf
+      - scscf
+    expose:
+      - "5060/tcp"
+      - "5060/udp"
+    networks:
+      privnet:
+        ipv4_address: ${PCSCF_IP}
+
+  smsc:
+    image: docker_kamailio
+    container_name: smsc
+    dns: ${DNS_IP}
+    volumes:
+      - ./smsc:/mnt/smsc
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - ./.env
+    environment:
+      - COMPONENT_NAME=smsc
+    depends_on:
+      - dns
+      - mysql
+    expose:
+      - "7090/udp"
+      - "7090/tcp"
+    networks:
+      privnet:
+        ipv4_address: ${SMSC_IP}
+
+volumes:
+  ims_dbdata:

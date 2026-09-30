@@ -62,14 +62,23 @@ ueransim-N2handover/
 │   ├── provision-subscriber.sh          通过 WebUI API 开通订阅者
 │   ├── run-handover.sh                  触发切换并打印两侧结果
 │   ├── ho-batch.sh                      批量切换驱动（N 次 / 往返 / 参数化）
-│   └── open5gs/                         docker_open5gs（VoNR）测试床 + IMS 通话中切换验收
-│       ├── README.md                    测试床部署/开户/验收步骤与排错
-│       ├── docker-compose.ueransim.yaml UERANSIM 侧 compose override
-│       ├── gnb1|gnb2|ue1|ue2.yaml       两 gNB 两 UE 配置（双 PDU 会话 + IMS）
-│       ├── provision.sh                 Open5GS + pyHSS 开户
-│       ├── run-ims-test.sh              一键验收（通话 + 双向切换 + RTP 缺口 + 事件相关性）
-│       ├── tweaks/apply-open5gs-tweaks.sh  测试床环境适配（3 处，幂等）
-│       └── evidence/ims-handover-summary.txt  实测证据摘要
+│   ├── open5gs/                         docker_open5gs（VoNR）测试床 + IMS 通话中切换验收
+│   │   ├── README.md                    测试床部署/开户/验收步骤与排错
+│   │   ├── docker-compose.ueransim.yaml UERANSIM 侧 compose override
+│   │   ├── gnb1|gnb2|ue1|ue2.yaml       两 gNB 两 UE 配置（双 PDU 会话 + IMS）
+│   │   ├── provision.sh                 Open5GS + pyHSS 开户
+│   │   ├── run-ims-test.sh              一键验收（通话 + N 次往返切换 + RTP 缺口 + 控制面耗时 + 事件相关性）
+│   │   ├── tweaks/apply-open5gs-tweaks.sh  测试床环境适配（3 处，幂等）
+│   │   └── evidence/ims-handover-summary.txt  实测证据摘要
+│   └── free5gc-ims/                     free5GC + IMS 测试床（方案 L）与双核对比
+│       ├── README.md                    部署/开户/验收步骤、排错（NSSF/重复会话/NAT 抓包）
+│       ├── docker-compose.ueransim.yaml UERANSIM 侧 overlay（两 gNB 两 UE）
+│       ├── docker-compose.ims.yaml      IMS 8 服务（接入 free5GC 网络）
+│       ├── gnb1|gnb2|ue1|ue2.yaml       free5GC 版配置（PLMN 001/01、双会话、ePCO+静态兜底）
+│       ├── env.free5gc                  IMS 侧 .env（free5GC 网络参数）
+│       ├── provision-free5gc-ims.sh     开户（WebUI 含 ims/SmPolicyData + pyHSS）
+│       ├── tweaks/apply-free5gc-ims-tweaks.sh  幂等适配（free5GC 侧 + IMS 侧 N5 关闭）
+│       └── evidence/                    实测证据（汇总/CSV/压缩抓包/双核对比）
 └── docs/
     ├── ARCHITECTURE.md          实现架构、仿真身份设计、与规范的对应与简化点
     ├── BUILD.md                 构建（含与 ueransim-ims 补丁共存的验证）
@@ -107,6 +116,7 @@ ctest --output-on-failure
 | 结构化事件日志 + 批量驱动 | ✅ free5GC 实测（3 次往返切换，`ho_id` 两侧一致、宿主机可见 JSONL）；详见 `docs/MEASUREMENT.md` |
 | **Open5GS 兼容性**（docker_open5gs `sa-vonr-deploy`，双 gNB + 双 UE） | ✅ 已验证：接入/双 PDU 会话/反复 N2 切换正常；详见 `docs/RUN.md` §10 |
 | **IMS 通话中切换验收**（VoNR，下游场景） | ✅ 已验证：通话经 gNB1→gNB2→gNB1 两次切换保持 CONFIRMED；RTP 最大间隔 39.8–40.9 ms、>60 ms 中断 0；证据 `deploy/open5gs/evidence/` |
+| **free5GC + IMS 验收**（方案 L；与 Open5GS 同协议对比） | ✅ 已验证：10 次往返（20 次切换）通话保持 CONFIRMED；RTP 最大间隔 ~41 ms、>60 ms 中断 0；双核控制面时序差异已记录；证据 `deploy/free5gc-ims/evidence/`；详见 `docs/RUN.md` §11 |
 
 ## 简化点（重要）
 

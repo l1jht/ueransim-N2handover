@@ -1,0 +1,58 @@
+free5GC + IMS N2-handover acceptance - measured summary (Plan L, 2026-09-30)
+================================================================================
+
+Testbed: free5GC v4.2.3 (minimal set + nssf) at 10.100.200.0/24, PLMN 001/01,
+         docker_open5gs IMS stack at 10.100.200.41-48 (P-CSCF 10.100.200.47),
+         UERANSIM (n2handover+ims build) gnb1/gnb2/ue1/ue2 at .131-.134,
+         IMS: internet+ims PDU sessions, call ue1->ue2, 10 round trips (20 handovers)
+
+-- call state after the 20 handovers, UE1 --
+{
+ state: "REGISTERED",
+ registered: true,
+ expires: 300,
+ retryCount: 0,
+ bound: true,
+ psi: 2,
+ localIp: "192.168.101.7",
+ error: "",
+ callState: "CONFIRMED",
+ callId: "1790756167358-4@192.168.101.7",
+ remote: "sip:001010000000002@ims.mnc001.mcc001.3gppnetwork.org",
+ mediaTxCount: 12388,
+ mediaRxCount: 12188,
+ smsResult: "",
+ smsHistory: ""
+}
+
+-- call state after the 20 handovers, UE2 --
+{
+ state: "REGISTERED",
+ registered: true,
+ expires: 300,
+ retryCount: 0,
+ bound: true,
+ psi: 2,
+ localIp: "192.168.101.8",
+ error: "",
+ callState: "CONFIRMED",
+ callId: "1790756167358-4@192.168.101.7",
+ remote: "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+ mediaTxCount: 12392,
+ mediaRxCount: 12391,
+ smsResult: "",
+ smsHistory: ""
+}
+
+-- per-handover analysis (RTP gaps + control-plane timings) --
+handovers analysed: 20 (threshold 60 ms)
+RTP gaps (ms), ue1 = handed-over UE, ue2 = control:
+  ue1 DL: n=20 min=24.4 med=35.6 p90=40.4 max=41.0 gaps>60ms=0
+  ue1 UL: n=20 min=26.1 med=37.6 p90=40.3 max=40.6 gaps>60ms=0
+  ue2 DL: n=20 min=26.2 med=37.6 p90=40.3 max=40.6 gaps>60ms=0
+  ue2 UL: n=20 min=24.3 med=35.6 p90=40.3 max=40.9 gaps>60ms=0
+control-plane phase durations (ms per handover):
+  prep(req->reqrecv): 27 23 21 25 25 24 23 24 27 21 22 24 22 23 25 21 26 22 24 24
+  ran(recfg->recfgcmpl): 0 1 0 0 0 1 0 1 1 0 0 0 1 0 0 0 0 1 0 0
+  exec(cmd->notify): 0 1 0 0 0 1 0 1 1 0 0 0 1 0 0 0 0 1 0 0
+  release(notify->ctxrel): 217 213 214 219 218 214 213 215 211 212 215 215 211 217 214 212 216 214 210 207

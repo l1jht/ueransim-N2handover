@@ -94,7 +94,23 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 **不涉及本补丁代码**；N2 切换在 Open5GS 上的行为与 free5GC 一致（含路径切换后源侧释放、
 目标侧 AMF-UE-NGAP-ID 重新分配的处理）。
 
-## 6. 结论
+## 6. free5GC + IMS 验收（与 Open5GS 对比）
+
+在同一 IMS 栈、同一 UE 客户端与同一测量口径下，另在 **free5GC v4.2.3** 上完成"IMS 通话中 N2 切换"
+验收（方案 L：free5GC 仅加 `ims` DNN 与开户；IMS 侧复用 docker_open5gs 组件；N5/RX 关闭）：
+
+| # | 测试 | 结果 |
+|---|---|---|
+| F1 | 两 UE 接入 + 双会话（internet+ims）+ IMS 注册 | ✅（P-CSCF 经 ePCO 下发：`pcscf=10.100.200.47 (EPCO)`） |
+| F2 | 通话 + **10 次往返切换（20 次）** | ✅ 20/20 保持 `CONFIRMED` |
+| F3 | RTP 缺口（阈值 60 ms） | ✅ 最大 ~41 ms，**>60 ms 中断 0** |
+| F4 | 与 Open5GS 基线对比（同协议） | ✅ RTP 连续性等价；控制面差异：prep 21–27 vs 11–13 ms、源侧释放 207–219 vs 501–508 ms |
+
+证据：`deploy/free5gc-ims/evidence/`；步骤、坑与排错：`deploy/free5gc-ims/README.md`。
+说明：本补丁（N2 切换）在 free5GC 与 Open5GS 上**行为一致**（控制面流程、`ho_id` 事件序列、切换后
+数据面路径切换均正常）；差异项均在 5GC 实现侧。free5GC/IMS 侧全部为环境配置改动（幂等脚本），补丁代码未变。
+
+## 7. 结论
 
 - 补丁**未引入对既有功能的回归**（含基线对照验证）；
 - N2 切换的正常路径（单 UE / 多 UE / 多 PDU 会话 / 反复切换）与失败路径（Preparation Failure）均按规范行为工作；

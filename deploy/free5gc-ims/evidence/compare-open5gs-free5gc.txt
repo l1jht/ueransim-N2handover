@@ -1,0 +1,23 @@
+Open5GS vs free5GC - IMS call continuity across N2 handovers (10 round trips each)
+=================================================================================
+
+Protocol: identical IMS stack/UE client/measurement (rtpengine-side capture, port-based
+          classification by media port 50002/50003, 60 ms interruption threshold).
+
+metric                             Open5GS (baseline)     free5GC (Plan L)
+handovers / call kept              20 / 20 CONFIRMED      20 / 20 CONFIRMED
+RTP gap max, ue1 DL (ms)           40.9                   41.0
+RTP gap max, ue1 UL (ms)           41.2                   40.6
+RTP gap max, ue2 DL (ctrl, ms)     41.3                   40.6
+RTP gap max, ue2 UL (ctrl, ms)     40.9                   40.9
+gaps > 60 ms                       0                      0
+prep req->reqrecv (ms)             11-13                  21-27
+ran recfg->recfgcmpl (ms)          0-1                    0-1
+exec cmd->notify (ms)              0-1                    0-1
+release notify->ctxrel (ms)        501-508                207-219
+
+Notes: the IMS side (domain, stack, UE client, media parameters) is identical in both
+environments; only the 5GC differs (free5GC UPF additionally masquerades the media,
+classification by UE-side media port is invariant to that). RTP-level continuity is
+equivalent; the control-plane timing differences reflect the two AMF/SMF implementations
+(free5GC: ~2x prepare round trip, ~2.4x faster source release).
