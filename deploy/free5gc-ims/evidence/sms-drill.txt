@@ -1,0 +1,26 @@
+IMS SMS drill - measured summary (free5GC + IMS testbed, 2026-09-30)
+===================================================================
+
+Prerequisite tweak: pyhss/default_ifc.xml - the SIP MESSAGE iFC ServerName
+  sip:smsc.ims.mnc001.mcc001.3gppnetwork.org:5060 -> :7090
+  (the SMSC listens on 7090; fixed by deploy/open5gs/tweaks/apply-open5gs-tweaks.sh
+  tweak #4; after the change: restart pyhss + scscf, then re-register both UEs
+  so the S-CSCF fetches the updated iFC).
+
+UE1 (imsi-001010000000001) -> UE2 (imsi-001010000000002):
+  nr-cli imsi-001010000000001 -e "ims-sms sip:001010000000002@ims.mnc001.mcc001.3gppnetwork.org hello-ueransim-sms-0930"
+  ue1: "SMS result: delivered (202)"; SMSC RP-ACK received
+  ue2: "SMS received from 001010000000001 [tpdu]: hello-ueransim-sms-0930"
+       smsHistory: "001010000000001: hello-ueransim-sms-0930"
+
+UE2 -> UE1 (reply):
+  ue2: "SMS result: delivered (202)"
+  ue1 smsHistory: "001010000000002: reply-from-ue2-ok"
+
+SMSC log (3GPP path):
+  MESSAGE ... SMS_FROM_3GPP: FROM 001010000000001 / TO 001010000000002
+  TEXT hello-ueransim-sms-0930 / DCS 8 (UCS2)
+  SMS_WORKER: delivered via the TS 24.341 path (application/vnd.3gpp.sms)
+
+Conclusion: the ueransim-ims SMS capability works on the combined n2handover+ims
+build (binary 3GPP path; the pjsua text/plain compatibility tweak is NOT needed).

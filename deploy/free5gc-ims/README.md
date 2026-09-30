@@ -82,6 +82,7 @@ RUN_DIR=<结果目录> HO_EVENTS_DIR=<compose-dir>/ho-events \
 | 空口重配（`RRC_RECFG_SENT→…COMPLETE_RECEIVED`） | 0–1 ms | 0–1 ms |
 | 执行（`HO_COMMAND_RECEIVED→HO_NOTIFY_SENT`） | 0–1 ms | 0–1 ms |
 | 源侧释放（`HO_NOTIFY_SENT→UE_CTX_RELEASE_RECEIVED`） | 207–219 ms | 501–508 ms |
+| IMS SMS 双向收发（TS 24.341 二进制路径） | ✅ `delivered (202)` + 对端 `smsHistory` 收到（`evidence/sms-drill.txt`） | 未测 |
 
 结论：**RTP 层面的通话连续性在两套核心网上等价**（均无 >60 ms 中断）；控制面时序差异来自两套
 AMF/SMF 实现（free5GC 准备往返约 2×，源侧释放约 2.4× 更快）。证据见 `evidence/`。
@@ -102,6 +103,10 @@ AMF/SMF 实现（free5GC 准备往返约 2×，源侧释放约 2.4× 更快）�
    ——SMF `dnnInfos[ims].pcscf.ipv4` 正常下发；UE 配置中的静态 `ims.pcscf` 仅作兜底。
 5. 其余沿用 Open5GS 侧经验：I-CSCF LIR 旁路、P-CSCF 关闭 IPSec 与 SIP/TCP 监听、S-CSCF MD5
    （我们的 IMS 客户端为 MD5 digest，password=Ki）。
+6. **SMS 需要 iFC 端口修正**：pyHSS `default_ifc.xml` 的 SIP MESSAGE iFC 指向 `sip:smsc…:5060`，
+   而 SMSC 监听 **7090** → 改为 7090（已固化进 `../open5gs/tweaks/apply-open5gs-tweaks.sh` tweak #4）；
+   改后**重启 `pyhss` 与 `scscf`** 并让 UE 重注册（S-CSCF 重取 iFC），SMS 即双向可达
+   （客户端走标准 3GPP 二进制路径，无需 pjsua 的 text/plain 兼容补丁）。
 
 ## 6. 本期不做（边界）
 

@@ -24,6 +24,10 @@
 #     N5 QoS authorization performed during IMS REGISTER/INVITE succeeds.
 #     File: pcf/pcf.yaml
 #
+#  4. pyHSS: the default iFC routes SIP MESSAGE to sip:smsc...:5060, but the SMSC
+#     listens on 7090 - without this fix SMS never reaches the SMSC.
+#     File: pyhss/default_ifc.xml
+#
 # Usage:  ./apply-open5gs-tweaks.sh [path-to-docker_open5gs]   (default: .)
 #         (run inside the checkout, or pass the checkout path)
 # Idempotent: already applied tweaks are reported and skipped.
@@ -236,5 +240,28 @@ else:
     print("  pcf/pcf.yaml: qos_profiles + policy added")
 PY
 
+echo "== 4. pyHSS: route SIP MESSAGE to the SMSC on port 7090 =="
+python3 - <<'PY'
+from pathlib import Path
+
+# The default iFC sends SIP MESSAGE to sip:smsc...:5060, but the SMSC listens on 7090.
+# Without this, SMS never reaches the SMSC (the SMSC does not answer on 5060).
+p = Path("pyhss/default_ifc.xml")
+if not p.exists():
+    print("  pyhss/default_ifc.xml: not found (skip)")
+else:
+    lines = p.read_text().splitlines(keepends=True)
+    changed = 0
+    for i, l in enumerate(lines):
+        if "sip:smsc" in l and "org:5060</ServerName>" in l:
+            lines[i] = l.replace("org:5060</ServerName>", "org:7090</ServerName>")
+            changed += 1
+    if changed:
+        p.write_text("".join(lines))
+        print(f"  pyhss/default_ifc.xml: smsc ServerName 5060 -> 7090 ({changed} line(s))")
+    else:
+        print("  pyhss/default_ifc.xml: already applied")
+PY
+
 echo "== done: rebuild/restart the affected containers =="
-echo "   docker compose -f sa-vonr-deploy.yaml restart icscf pcscf pcf"
+echo "   docker compose -f sa-vonr-deploy.yaml restart icscf pcscf pcf pyhss scscf"
