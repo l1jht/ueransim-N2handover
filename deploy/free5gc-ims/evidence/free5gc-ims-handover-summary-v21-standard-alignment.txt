@@ -1,0 +1,43 @@
+== free5GC v2.1 standard-alignment acceptance (2026-10-01) ==
+build: UERANSIM v3.3.0 + n2handover.patch (v2.1, commit 352983b) + ims.patch
+changes: C1 per-flow dataForwardingAccepted / C2 honor DataForwardingNotPossible / C3 end marker forwarding / C4 failed session release list
+
+-- call/media counters (10 round trips / 20 handovers) --
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue1.txt: callState: "CONFIRMED",
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue1.txt: mediaTxCount: 12390,
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue1.txt: mediaRxCount: 12391,
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue2.txt: callState: "CONFIRMED",
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue2.txt: mediaTxCount: 12396,
+/tmp/opencode/v21-f5gc-run2/ims-ho-results/after-ue2.txt: mediaRxCount: 12393,
+
+-- RTP gap analysis + control plane --
+handovers analysed: 20 (threshold 60 ms)
+RTP gaps (ms), ue1 = handed-over UE, ue2 = control:
+  ue1 DL: n=20 min=26.0 med=31.9 p90=36.6 max=38.1 gaps>60ms=0
+  ue1 UL: n=20 min=28.0 med=37.6 p90=40.2 max=41.1 gaps>60ms=0
+  ue2 DL: n=20 min=28.0 med=37.6 p90=40.2 max=41.1 gaps>60ms=0
+  ue2 UL: n=20 min=26.0 med=31.9 p90=36.6 max=38.1 gaps>60ms=0
+control-plane phase durations (ms per handover):
+  prep(req->reqrecv): 25 24 23 26 24 24 21 28 24 22 25 26 23 28 27 24 26 26 23 28
+  ran(recfg->recfgcmpl): 0 1 0 0 1 1 0 1 1 1 0 0 1 0 0 0 0 0 0 0
+  exec(cmd->notify): 0 1 0 0 1 1 0 1 1 1 0 0 1 0 0 0 1 0 0 0
+  release(notify->ctxrel): 214 211 213 223 218 215 204 220 213 216 215 218 219 216 216 214 218 216 219 219
+
+-- v2.1 new behaviour counts (per gNB, 20 handovers) --
+  gnb1: endpoint announced=24 end-marker forwarded=26 end-marker received=24 unhandled-GTP=0 forwarding started=13
+  gnb2: endpoint announced=26 end-marker forwarded=24 end-marker received=26 unhandled-GTP=0 forwarding started=12
+
+-- multi-UE concurrent handover isolation (ue1+ue2 out and back) --
+  to gnb2: ue1 ping 200/200 0% loss, ue2 ping 200/200 0% loss
+  back to gnb1: ue1 160/160 0% loss, ue2 160/160 0% loss
+  per-UE forwarding (source gnb1 excerpt):
+    [2026-10-01 04:33:06.531] [gtp] [info] N2 handover: data forwarding stopped for UE[1], 14 packet(s) in total
+    [2026-10-01 04:33:08.602] [gtp] [info] N2 handover: data forwarding stopped for UE[2] PSI[2] (0 packet(s) forwarded)
+    [2026-10-01 04:33:08.602] [gtp] [info] N2 handover: data forwarding stopped for UE[2] PSI[1] (4 packet(s) forwarded)
+    [2026-10-01 04:33:08.602] [gtp] [info] N2 handover: data forwarding stopped for UE[2], 4 packet(s) in total
+  target endpoints per UE (gnb2 excerpt):
+    [2026-10-01 04:33:06.305] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[449741732146112902] PSI[1], TEID[2147483669]
+    [2026-10-01 04:33:06.305] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[449741732146112902] PSI[2], TEID[2147483670]
+    [2026-10-01 04:33:08.377] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[1236164091269907089] PSI[1], TEID[2147483671]
+    [2026-10-01 04:33:08.377] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[1236164091269907089] PSI[2], TEID[2147483672]
+  hygiene: TEID-not-found=0, unhandled-GTP=0

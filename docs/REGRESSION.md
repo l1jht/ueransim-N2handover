@@ -137,3 +137,12 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 - 证据：`deploy/open5gs/evidence/ims-handover-summary-v2-forwarding.txt`、`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v2-forwarding.txt`。
 
 **新增观察（free5GC 运维）**：中断的切换流程（例如对错误 ue-id 触发）会令 AMF 残留 `N2 handover is ongoing`，随后该 UE 的注册被拒（`Registration Reject [CONGESTION]`）；重启 `amf/smf/upf` 并重连 gNB/UE 恢复。另：验收脚本的 ue-id 跟踪已从"目标列表差分"改为**目标 gNB 日志权威 id**（free5GC 下 id 会复用，差分失效）。
+
+### 8.1 v2.1 标准对齐（2026-10-01）
+
+- 变更（commit `352983b`，补丁 3452 行）：C1 per-flow `dataForwardingAccepted`；C2 尊重 `DataForwardingNotPossible`（不公告转发端点）；C3 End Marker 转发（源）/记录（目标）；C4 失败会话列表解析与本地释放；
+- free5GC 复验（10 次往返/20 次切换）：通话 20/20 CONFIRMED；RTP max ue1 DL 38.1 / UL 41.1 ms、>60 ms 中断 0；ue1 计数差 1 包；**end marker 20/20 转发并接收、`Unhandled GTP-U` 归零**；
+- 多 UE 并发切换（ue1+ue2 先后切出再切回）：双向 ping 0% 丢包、每 UE 独立 STI/TEID、无交叉；无 `TEID not found`；
+- 未在实测中触发（代码路径就位）：C2（核心网未置 `DataForwardingNotPossible`）、C4（无失败会话）；
+- 运维注记：验收脚本假定 ue1 起始在 GNB1；否则 `handover` 命令空跑（事件日志无新增、RTP 窗口 n/a）。
+- 证据：`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`。

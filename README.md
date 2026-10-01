@@ -118,6 +118,7 @@ ctest --output-on-failure
 | **IMS 通话中切换验收**（VoNR，下游场景） | ✅ 已验证：通话经 gNB1→gNB2→gNB1 两次切换保持 CONFIRMED；RTP 最大间隔 39.8–40.9 ms、>60 ms 中断 0；证据 `deploy/open5gs/evidence/` |
 | **free5GC + IMS 验收**（方案 L；与 Open5GS 同协议对比） | ✅ 已验证：10 次往返（20 次切换）通话保持 CONFIRMED；RTP 最大间隔 ~41 ms、>60 ms 中断 0；**SMS 双向收发**（TS 24.341，`delivered (202)` + 对端收到）；双核控制面时序差异已记录；证据 `deploy/free5gc-ims/evidence/`；详见 `docs/RUN.md` §11 |
 | **数据转发（v2，2026-10-01）** | ✅ 已验证：free5GC/Open5GS 各 10 次往返（20 次切换）通话保持 CONFIRMED；UE 侧 `mediaTx/mediaRx` 差 0–3 包、RTP >60 ms 中断 0；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/*/evidence/*v2-forwarding*`；详见 `docs/RUN.md` §12 |
+| **标准对齐（v2.1，2026-10-01）** | ✅ C1 per-flow `dataForwardingAccepted`、C2 尊重 `DataForwardingNotPossible`、C3 End Marker 转发/接收、C4 失败会话列表；free5GC 20 次切换复验（计数差 1 包、>60 ms 中断 0、end marker 20/20、无未处理 GTP）+ 两 UE 并发切换隔离验证；证据 `deploy/free5gc-ims/evidence/*v21*` |
 
 ## 简化点（重要）
 

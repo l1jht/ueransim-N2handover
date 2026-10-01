@@ -303,8 +303,8 @@ free5gc-rtp.txt.gz, compare-open5gs-free5gc.txt}`。
 > v2（2026-10-01）起，切换包含 gNB 间数据转发：源侧重定向 + 目标侧接收/缓存/会话寿命别名；无需核心网改造（free5GC=直连口味、Open5GS=间接口味，gNB 侧统一处理）。
 
 **日志对照（每次切换）**
-- 源 gNB：`PSI[p] DL forwarding TNL received (teid[...])` → `data forwarding started for UE[x], N session(s)` → 首包 `data forwarding active, first packet sent to the forwarding TNL (QFI[q])` → 释放时 `data forwarding stopped ... (N packet(s) forwarded)`；
-- 目标 gNB：`DL forwarding endpoint registered ... TEID[0x8000xxxx]` → UE 到达后 `forwarding data flushed ... the endpoint remains a downlink alias of the session`；
+- 源 gNB：`PSI[p] DL forwarding TNL received (teid[...])` → `data forwarding started for UE[x], N session(s)` → 首包 `data forwarding active, first packet sent to the forwarding TNL (QFI[q])` → 收到 UPF end marker 时 `end marker forwarded to the forwarding TNL` → 释放时 `data forwarding stopped ... (N packet(s) forwarded)`；
+- 目标 gNB：`PSI[p] DL forwarding endpoint announced (teid[...]), data forwarding accepted for N QoS flow(s)`（v2.1）→ `DL forwarding endpoint registered ... TEID[0x8000xxxx]` → UE 到达后 `forwarding data flushed ... the endpoint remains a downlink alias of the session` → 收到 end marker 时 `end marker received on the forwarding endpoint for PSI[p] (forwarding complete)`；
 - 定时器：`TNGRELOCprep`（5 s，Handover Required→Command）与 `TNGRELOCoverall`（10 s，Command→UE Context Release）正常时不打印；超时打印告警（prep 中止准备、overall 停转发并请求释放）。
 
 **验收命令**（与既有 IMS 验收相同脚本）
@@ -315,5 +315,6 @@ RUN_DIR=<results> HO_EVENTS_DIR=<compose-dir>/ho-events \
 ```
 
 **结果（2026-10-01，两核各 10 次往返/20 次切换）**：通话保持 CONFIRMED；RTP >60 ms 中断 0；UE 侧 `mediaTx/mediaRx` 差 0–3 包（约 0 丢包）；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/open5gs/evidence/ims-handover-summary-v2-forwarding.txt`、`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v2-forwarding.txt`。
+**v2.1 复验（同日，free5GC）**：20 次切换计数差 1 包、>60 ms 中断 0、end marker 20/20 转发并接收、无未处理 GTP；另做两 UE 并发切换隔离验证（双向 0% 丢包）；证据 `deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`。
 
-**排错提示（free5GC）**：若测试过程中出现**中断的切换流程**（例如对错误的 ue-id 触发），AMF 可能残留 `N2 handover is ongoing` 状态并拒绝该 UE 的后续注册（`Registration Reject [CONGESTION]`）；重启 `amf/smf/upf` 并重连 gNB/UE 即可恢复。
+**排错提示（free5GC）**：若测试过程中出现**中断的切换流程**（例如对错误的 ue-id 触发），AMF 可能残留 `N2 handover is ongoing` 状态并拒绝该 UE 的后续注册（`Registration Reject [CONGESTION]`）；重启 `amf/smf/upf` 并重连 gNB/UE 即可恢复。另：验收脚本假定 **ue1 起始驻留 GNB1**（`-u` 需与之一致），起始状态不符时所有 `handover` 命令空跑（表现为事件日志无新增、RTP 窗口 n/a）。
