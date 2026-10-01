@@ -119,6 +119,7 @@ ctest --output-on-failure
 | **free5GC + IMS 验收**（方案 L；与 Open5GS 同协议对比） | ✅ 已验证：10 次往返（20 次切换）通话保持 CONFIRMED；RTP 最大间隔 ~41 ms、>60 ms 中断 0；**SMS 双向收发**（TS 24.341，`delivered (202)` + 对端收到）；双核控制面时序差异已记录；证据 `deploy/free5gc-ims/evidence/`；详见 `docs/RUN.md` §11 |
 | **数据转发（v2，2026-10-01）** | ✅ 已验证：free5GC/Open5GS 各 10 次往返（20 次切换）通话保持 CONFIRMED；UE 侧 `mediaTx/mediaRx` 差 0–3 包、RTP >60 ms 中断 0；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/*/evidence/*v2-forwarding*`；详见 `docs/RUN.md` §12 |
 | **标准对齐（v2.1，2026-10-01）** | ✅ C1 per-flow `dataForwardingAccepted`、C2 尊重 `DataForwardingNotPossible`、C3 End Marker 转发/接收、C4 失败会话列表；free5GC 20 次切换复验（计数差 1 包、>60 ms 中断 0、end marker 20/20、无未处理 GTP）+ 两 UE 并发切换隔离验证；证据 `deploy/free5gc-ims/evidence/*v21*` |
+| **Handover Cancel（v2.2，2026-10-01）** | ✅ 源侧 TNGRELOCprep 超时发起 Cancel（cause=tngrelocprep expiry）+ Ack 处理 + 目标侧容忍释放 + 预置上下文释放清理；free5GC 实测 AMF `Handle HandoverCancel` 并清除陈旧状态；正常路径无回归；规范审计见 `docs/STANDARDS-AUDIT.md` |
 
 > 规范依据核对：`docs/STANDARDS-AUDIT.md`（对 `docs/N2-handover.md` 基准文档的逐条原文审计，2026-10-01；38.413/23.502/38.300 原文逐字核对）。
 

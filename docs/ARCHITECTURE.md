@@ -128,7 +128,7 @@
 | 3 | 转发为**会话级**（非 QoS 流级）；无 PDCP SN/重排序（FIFO 缓存 + "flush 先于新数据"）；End Marker 转发（源）/记录（目标），无重排序语义（v2.1） | 仿真中 QoS 流级与 PDCP 重排序不可观测；转发与 per-flow `dataForwardingAccepted` 已实现（v2/v2.1，2026-10-01） |
 | 4 | 不实现 RAN Status Transfer / PDCP SN 与 HFN 保持 | 无损切换语义不模拟 |
 | 5 | 不实现 DAPS、Handover Cancel、Handover Success | 基础场景之外 |
-| 6 | TNGRELOCprep/TNGRELOCoverall 已实现（常数 5 s / 10 s） | prep 超时本地中止（不发 Handover Cancel，偏差）；overall 超时停止转发并请求释放（TS 38.413 §8.4.1.2/§9.6） |
+| 6 | TNGRELOCprep/TNGRELOCoverall 已实现（常数 5 s / 10 s）；prep 超时发起 **Handover Cancel**（含 Cancel Ack 处理与目标侧容忍释放）；overall 超时停止转发并按规范 cause 请求释放 | TS 38.413 §8.4.1.2 / §8.3.3.4 / §8.4.5 |
 | 7 | 目标小区 NCI 由 gNB ID 约定推导（见 §3.4） | 仿真中替代 ANR/OAM |
 | 8 | 假定两 gNB 同 PLMN/TAC（TargetID 的 selectedTAI 用源侧配置） | 基础场景；跨 PLMN/TAC 需扩展 |
 | 9 | 每次 Handover Required 携带"全部 PDU 会话" | 与规范一致；但 QoS 流级失败处理从简（会话级） |

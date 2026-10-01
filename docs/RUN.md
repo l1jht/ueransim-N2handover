@@ -305,7 +305,7 @@ free5gc-rtp.txt.gz, compare-open5gs-free5gc.txt}`。
 **日志对照（每次切换）**
 - 源 gNB：`PSI[p] DL forwarding TNL received (teid[...])` → `data forwarding started for UE[x], N session(s)` → 首包 `data forwarding active, first packet sent to the forwarding TNL (QFI[q])` → 收到 UPF end marker 时 `end marker forwarded to the forwarding TNL` → 释放时 `data forwarding stopped ... (N packet(s) forwarded)`；
 - 目标 gNB：`PSI[p] DL forwarding endpoint announced (teid[...]), data forwarding accepted for N QoS flow(s)`（v2.1）→ `DL forwarding endpoint registered ... TEID[0x8000xxxx]` → UE 到达后 `forwarding data flushed ... the endpoint remains a downlink alias of the session` → 收到 end marker 时 `end marker received on the forwarding endpoint for PSI[p] (forwarding complete)`；
-- 定时器：`TNGRELOCprep`（5 s，Handover Required→Command）与 `TNGRELOCoverall`（10 s，Command→UE Context Release）正常时不打印；超时打印告警（prep 中止准备、overall 停转发并请求释放）。
+- 定时器：`TNGRELOCprep`（5 s，Handover Required→Command）与 `TNGRELOCoverall`（10 s，Command→UE Context Release）正常时不打印；prep 超时打印告警并发送 **`Handover Cancel`**（`Handover Cancel sent ... (cause: TNGRELOCprep expiry)`；收到 Ack 时打印 `Handover Cancel Acknowledge received`，缺失按 TS 38.413 §8.4.5.4 视为成功）；overall 超时停转发并按规范 cause 请求释放。
 
 **验收命令**（与既有 IMS 验收相同脚本）
 

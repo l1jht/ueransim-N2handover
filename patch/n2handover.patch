@@ -629,7 +629,7 @@ index 6111b9b..52312b2 100644
      void updateAmbrForSession(uint64_t pduSession);
  };
 diff --git a/src/gnb/ngap/context.cpp b/src/gnb/ngap/context.cpp
-index 95a43cf..e63cefb 100644
+index 95a43cf..f8be8b8 100644
 --- a/src/gnb/ngap/context.cpp
 +++ b/src/gnb/ngap/context.cpp
 @@ -12,6 +12,7 @@
@@ -640,7 +640,7 @@ index 95a43cf..e63cefb 100644
  
  #include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
  #include <asn/ngap/ASN_NGAP_AssociatedQosFlowItem.h>
-@@ -236,6 +237,24 @@ void NgapTask::receiveContextRelease(int amfId, ASN_NGAP_UEContextReleaseCommand
+@@ -236,6 +237,35 @@ void NgapTask::receiveContextRelease(int amfId, ASN_NGAP_UEContextReleaseCommand
      if (ue == nullptr)
          return;
  
@@ -662,15 +662,26 @@ index 95a43cf..e63cefb 100644
 +        ho::EventLog::Instance().emit(event);
 +    }
 +
++    // A prepared (provisional) context is released when the AMF cancels the handover or the
++    // preparation is abandoned: release the pending handover state (including the announced data
++    // forwarding endpoints) as well (TS 23.502 4.9.1.4 / 4.11.1.2.3).
++    if (ue->ctxId < 0)
++    {
++        auto *response = asn::ngap::NewMessagePdu<ASN_NGAP_UEContextReleaseComplete>({});
++        sendNgapUeAssociated(ue->ctxId, response);
++        cancelPendingHandover(ue->sti, "prepared context released by the AMF");
++        return;
++    }
++
      // Notify RRC task
      auto w1 = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::AN_RELEASE);
      w1->ueId = ue->ctxId;
 diff --git a/src/gnb/ngap/handover.cpp b/src/gnb/ngap/handover.cpp
 new file mode 100644
-index 0000000..8cae012
+index 0000000..54acc18
 --- /dev/null
 +++ b/src/gnb/ngap/handover.cpp
-@@ -0,0 +1,1029 @@
+@@ -0,0 +1,1098 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -710,6 +721,8 @@ index 0000000..8cae012
 +#include <asn/ngap/ASN_NGAP_DirectForwardingPathAvailability.h>
 +#include <asn/ngap/ASN_NGAP_GTPTunnel.h>
 +#include <asn/ngap/ASN_NGAP_GlobalGNB-ID.h>
++#include <asn/ngap/ASN_NGAP_HandoverCancel.h>
++#include <asn/ngap/ASN_NGAP_HandoverCancelAcknowledge.h>
 +#include <asn/ngap/ASN_NGAP_HandoverCommand.h>
 +#include <asn/ngap/ASN_NGAP_HandoverCommandTransfer.h>
 +#include <asn/ngap/ASN_NGAP_HandoverFailure.h>
@@ -1595,13 +1608,6 @@ index 0000000..8cae012
 +
 +void NgapTask::receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg)
 +{
-+    auto *ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_Cause);
-+    if (ie != nullptr)
-+        m_logger->err("N2 handover: handover preparation failure, cause[%s]",
-+                      ngap_utils::CauseToString(ie->Cause).c_str());
-+    else
-+        m_logger->err("N2 handover: handover preparation failure");
-+
 +    auto idPair = ngap_utils::FindNgapIdPair(msg);
 +    NgapUeContext *ue = nullptr;
 +    if (idPair.ranUeNgapId.has_value())
@@ -1609,11 +1615,83 @@ index 0000000..8cae012
 +    if (ue == nullptr && idPair.amfUeNgapId.has_value())
 +        ue = findUeByAmfId(idPair.amfUeNgapId.value());
 +
-+    if (ue != nullptr)
-+        ue->hoPrepTimerActive = false;
++    if (ue == nullptr || !ue->hoPrepTimerActive)
++    {
++        // A late Preparation Failure is ignored, e.g. after the Handover Cancel procedure has been
++        // initiated (TS 38.413 8.4.1.3).
++        m_logger->debug("N2 handover: ignoring a Handover Preparation Failure without a pending preparation");
++        return;
++    }
 +
-+    ho::EventLog::Instance().emit(MakeEvent(ho::EventRole::Source, ho::EventPhase::HoPrepFailure,
-+                                            ue != nullptr ? ue->hoId : 0, ue, m_base->config->nci, SessionsOf(ue)));
++    auto *ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_Cause);
++    if (ie != nullptr)
++        m_logger->err("N2 handover: handover preparation failure, cause[%s]",
++                      ngap_utils::CauseToString(ie->Cause).c_str());
++    else
++        m_logger->err("N2 handover: handover preparation failure");
++
++    ue->hoPrepTimerActive = false;
++
++    ho::EventLog::Instance().emit(
++        MakeEvent(ho::EventRole::Source, ho::EventPhase::HoPrepFailure, ue->hoId, ue, m_base->config->nci, SessionsOf(ue)));
++}
++
++void NgapTask::sendHandoverCancel(int ueId)
++{
++    auto *ue = findUeContext(ueId);
++    if (ue == nullptr)
++        return;
++
++    // The AMF UE NGAP ID and RAN UE NGAP ID IEs are attached automatically (sendNgapUeAssociated).
++    std::vector<ASN_NGAP_HandoverCancelIEs *> ies;
++
++    auto *ieCause = asn::New<ASN_NGAP_HandoverCancelIEs>();
++    ieCause->id = ASN_NGAP_ProtocolIE_ID_id_Cause;
++    ieCause->criticality = ASN_NGAP_Criticality_ignore;
++    ieCause->value.present = ASN_NGAP_HandoverCancelIEs__value_PR_Cause;
++    ngap_utils::ToCauseAsn_Ref(NgapCause::RadioNetwork_tngrelocprep_expiry, ieCause->value.choice.Cause);
++    ies.push_back(ieCause);
++
++    sendNgapUeAssociated(ueId, asn::ngap::NewMessagePdu<ASN_NGAP_HandoverCancel>(ies));
++
++    m_logger->info("N2 handover: Handover Cancel sent for UE[%d] (cause: TNGRELOCprep expiry)", ueId);
++}
++
++void NgapTask::receiveHandoverCancel(int amfId, ASN_NGAP_HandoverCancel *msg)
++{
++    // The Handover Cancellation procedure is defined between the source NG-RAN node and the AMF
++    // (TS 38.413 8.4.5); the AMF releases the resources reserved at the target via the UE Context
++    // Release procedure (TS 23.502 4.9.1.4 / 4.11.1.2.3). This handler tolerates a Handover Cancel
++    // addressed to this node: any handover preparation pending for the UE is released.
++    auto idPair = ngap_utils::FindNgapIdPair(msg);
++    NgapUeContext *ue = nullptr;
++    if (idPair.ranUeNgapId.has_value())
++        ue = findUeByRanId(idPair.ranUeNgapId.value());
++    if (ue == nullptr && idPair.amfUeNgapId.has_value())
++        ue = findUeByAmfId(idPair.amfUeNgapId.value());
++
++    if (ue != nullptr && ue->ctxId < 0)
++    {
++        m_logger->warn("N2 handover: Handover Cancel received for prepared UE[%d], releasing the reserved resources",
++                       ue->ctxId);
++        cancelPendingHandover(ue->sti, "Handover Cancel received");
++    }
++    else
++    {
++        m_logger->warn("N2 handover: Handover Cancel received but no matching handover preparation was found");
++    }
++}
++
++void NgapTask::receiveHandoverCancelAcknowledge(ASN_NGAP_HandoverCancelAcknowledge *msg)
++{
++    // If the acknowledge is missing, the cancellation is considered successful anyway
++    // (TS 38.413 8.4.5.4).
++    auto idPair = ngap_utils::FindNgapIdPair(msg);
++    if (idPair.ranUeNgapId.has_value())
++        m_logger->info("N2 handover: Handover Cancel Acknowledge received (ran-ue-ngap-id[%ld])",
++                       idPair.ranUeNgapId.value());
++    else
++        m_logger->info("N2 handover: Handover Cancel Acknowledge received");
 +}
 +
 +void NgapTask::cancelPendingHandover(uint64_t ueSti, const char *reason)
@@ -1665,12 +1743,14 @@ index 0000000..8cae012
 +        return;
 +
 +    ue->hoPrepTimerActive = false;
-+    ue->hoId = 0;
 +
-+    m_logger->warn("N2 handover: TNGRELOCprep expired for UE[%d], aborting the handover preparation (a late "
-+                   "Handover Command or Preparation Failure is ignored; Handover Cancel is not implemented in "
-+                   "this simulation)",
++    m_logger->warn("N2 handover: TNGRELOCprep expired for UE[%d], cancelling the handover preparation "
++                   "(Handover Cancel sent to the AMF; a late Handover Command or Preparation Failure is ignored)",
 +                   ueId);
++
++    sendHandoverCancel(ueId);
++
++    ue->hoId = 0;
 +}
 +
 +void NgapTask::handleTngRelocOverallTimeout(int ueId)
@@ -1791,7 +1871,7 @@ index b0abae9..be04987 100644
          break;
      }
 diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
-index 14ea956..1da9de9 100644
+index 14ea956..1885bf2 100644
 --- a/src/gnb/ngap/task.hpp
 +++ b/src/gnb/ngap/task.hpp
 @@ -8,8 +8,10 @@
@@ -1805,18 +1885,20 @@ index 14ea956..1da9de9 100644
  
  #include <gnb/nts.hpp>
  #include <gnb/types.hpp>
-@@ -34,6 +36,10 @@ extern "C"
+@@ -34,6 +36,12 @@ extern "C"
      struct ASN_NGAP_OverloadStop;
      struct ASN_NGAP_PDUSessionResourceReleaseCommand;
      struct ASN_NGAP_Paging;
 +    struct ASN_NGAP_HandoverRequired;
 +    struct ASN_NGAP_HandoverRequest;
++    struct ASN_NGAP_HandoverCancel;
++    struct ASN_NGAP_HandoverCancelAcknowledge;
 +    struct ASN_NGAP_HandoverCommand;
 +    struct ASN_NGAP_HandoverPreparationFailure;
  }
  
  namespace nr::gnb
-@@ -54,8 +60,37 @@ class NgapTask : public NtsTask
+@@ -54,8 +62,37 @@ class NgapTask : public NtsTask
      std::unordered_map<int, NgapUeContext *> m_ueCtx;
      int64_t m_ueNgapIdCounter;
      uint32_t m_downlinkTeidCounter;
@@ -1854,7 +1936,7 @@ index 14ea956..1da9de9 100644
      friend class GnbCmdHandler;
  
    public:
-@@ -71,7 +106,7 @@ class NgapTask : public NtsTask
+@@ -71,7 +108,7 @@ class NgapTask : public NtsTask
      /* Utility functions */
      void createAmfContext(const GnbAmfConfig &config);
      NgapAmfContext *findAmfContext(int ctxId);
@@ -1863,7 +1945,7 @@ index 14ea956..1da9de9 100644
      NgapUeContext *findUeContext(int ctxId);
      NgapUeContext *findUeByRanId(int64_t ranUeNgapId);
      NgapUeContext *findUeByAmfId(int64_t amfUeNgapId);
-@@ -99,7 +134,7 @@ class NgapTask : public NtsTask
+@@ -99,7 +136,7 @@ class NgapTask : public NtsTask
  
      /* NAS transport */
      void handleInitialNasTransport(int ueId, OctetString &nasPdu, int64_t rrcEstablishmentCause,
@@ -1872,7 +1954,7 @@ index 14ea956..1da9de9 100644
      void handleUplinkNasTransport(int ueId, const OctetString &nasPdu);
      void receiveDownlinkNasTransport(int amfId, ASN_NGAP_DownlinkNASTransport *msg);
      void deliverDownlinkNas(int ueId, OctetString &&nasPdu);
-@@ -124,6 +159,18 @@ class NgapTask : public NtsTask
+@@ -124,6 +161,21 @@ class NgapTask : public NtsTask
      /* Radio resource control */
      void handleRadioLinkFailure(int ueId);
      void receivePaging(int amfId, ASN_NGAP_Paging *msg);
@@ -1884,6 +1966,9 @@ index 14ea956..1da9de9 100644
 +    void handleHandoverConfirm(int ueId, uint64_t sti);
 +    void sendHandoverNotify(int ueId);
 +    void receiveHandoverPreparationFailure(ASN_NGAP_HandoverPreparationFailure *msg);
++    void sendHandoverCancel(int ueId);
++    void receiveHandoverCancel(int amfId, ASN_NGAP_HandoverCancel *msg);
++    void receiveHandoverCancelAcknowledge(ASN_NGAP_HandoverCancelAcknowledge *msg);
 +    void cancelPendingHandover(uint64_t ueSti, const char *reason);
 +    void cleanupPendingHandovers();
 +    void handleTngRelocPrepTimeout(int ueId);
@@ -1893,30 +1978,45 @@ index 14ea956..1da9de9 100644
  } // namespace nr::gnb
 \ No newline at end of file
 diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
-index 46c5862..81b11bf 100644
+index 46c5862..96ac8a9 100644
 --- a/src/gnb/ngap/transport.cpp
 +++ b/src/gnb/ngap/transport.cpp
-@@ -327,6 +327,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+@@ -17,6 +17,8 @@
+ #include <lib/asn/utils.hpp>
+ 
+ #include <asn/ngap/ASN_NGAP_AMF-UE-NGAP-ID.h>
++#include <asn/ngap/ASN_NGAP_HandoverCancel.h>
++#include <asn/ngap/ASN_NGAP_HandoverCancelAcknowledge.h>
+ #include <asn/ngap/ASN_NGAP_InitiatingMessage.h>
+ #include <asn/ngap/ASN_NGAP_NGAP-PDU.h>
+ #include <asn/ngap/ASN_NGAP_NRNTNTAIInformation.h>
+@@ -327,6 +329,12 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
          case ASN_NGAP_InitiatingMessage__value_PR_Paging:
              receivePaging(amf->ctxId, &value.choice.Paging);
              break;
 +        case ASN_NGAP_InitiatingMessage__value_PR_HandoverRequest:
 +            receiveHandoverRequest(amf->ctxId, stream, &value.choice.HandoverRequest);
 +            break;
++        case ASN_NGAP_InitiatingMessage__value_PR_HandoverCancel:
++            receiveHandoverCancel(amf->ctxId, &value.choice.HandoverCancel);
++            break;
          default:
              m_logger->err("Unhandled NGAP initiating-message received (%d)", value.present);
              break;
-@@ -340,6 +343,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+@@ -340,6 +348,12 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
          case ASN_NGAP_SuccessfulOutcome__value_PR_NGSetupResponse:
              receiveNgSetupResponse(amf->ctxId, &value.choice.NGSetupResponse);
              break;
 +        case ASN_NGAP_SuccessfulOutcome__value_PR_HandoverCommand:
 +            receiveHandoverCommand(amf->ctxId, &value.choice.HandoverCommand);
 +            break;
++        case ASN_NGAP_SuccessfulOutcome__value_PR_HandoverCancelAcknowledge:
++            receiveHandoverCancelAcknowledge(&value.choice.HandoverCancelAcknowledge);
++            break;
          default:
              m_logger->err("Unhandled NGAP successful-outcome received (%d)", value.present);
              break;
-@@ -353,6 +359,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+@@ -353,6 +367,9 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
          case ASN_NGAP_UnsuccessfulOutcome__value_PR_NGSetupFailure:
              receiveNgSetupFailure(amf->ctxId, &value.choice.NGSetupFailure);
              break;
@@ -1926,7 +2026,7 @@ index 46c5862..81b11bf 100644
          default:
              m_logger->err("Unhandled NGAP unsuccessful-outcome received (%d)", value.present);
              break;
-@@ -371,6 +380,13 @@ bool NgapTask::handleSctpStreamId(int amfId, int stream, const ASN_NGAP_NGAP_PDU
+@@ -371,6 +388,13 @@ bool NgapTask::handleSctpStreamId(int amfId, int stream, const ASN_NGAP_NGAP_PDU
      if (m_base->config->ignoreStreamIds)
          return true;
  
