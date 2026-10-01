@@ -41,3 +41,9 @@ control-plane phase durations (ms per handover):
     [2026-10-01 04:33:08.377] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[1236164091269907089] PSI[1], TEID[2147483671]
     [2026-10-01 04:33:08.377] [gtp] [info] N2 handover: DL forwarding endpoint registered for sti[1236164091269907089] PSI[2], TEID[2147483672]
   hygiene: TEID-not-found=0, unhandled-GTP=0
+
+-- failure path (v2.1): handover to a non-existent target gNB[9] --
+  gnb1: 'Handover Required sent for UE[1] towards gNB[id 9]'
+  gnb1: 'TNGRELOCprep expired for UE[1], aborting the handover preparation ...' (5 s, local abort; Handover Cancel not implemented - documented deviation)
+  no 'data forwarding started' for this handover; UE stayed on the source gNB
+  note: free5GC AMF did not answer the invalid TargetID (no Handover Preparation Failure); the gNB handled the no-response case via TNGRELOCprep as designed

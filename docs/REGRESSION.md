@@ -143,6 +143,7 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 - 变更（commit `352983b`，补丁 3452 行）：C1 per-flow `dataForwardingAccepted`；C2 尊重 `DataForwardingNotPossible`（不公告转发端点）；C3 End Marker 转发（源）/记录（目标）；C4 失败会话列表解析与本地释放；
 - free5GC 复验（10 次往返/20 次切换）：通话 20/20 CONFIRMED；RTP max ue1 DL 38.1 / UL 41.1 ms、>60 ms 中断 0；ue1 计数差 1 包；**end marker 20/20 转发并接收、`Unhandled GTP-U` 归零**；
 - 多 UE 并发切换（ue1+ue2 先后切出再切回）：双向 ping 0% 丢包、每 UE 独立 STI/TEID、无交叉；无 `TEID not found`；
+- 失败路径（确定性）：切换到不存在的目标 gNB[9] → 源侧 `Handover Required sent` 后 5 s **TNGRELOCprep 超时本地中止**（不发 Cancel，文档化偏差）、**未建立转发**、UE 驻留源侧；free5GC AMF 对无效 TargetID 未回 PreparationFailure（核心网行为）；
 - 未在实测中触发（代码路径就位）：C2（核心网未置 `DataForwardingNotPossible`）、C4（无失败会话）；
 - 运维注记：验收脚本假定 ue1 起始在 GNB1；否则 `handover` 命令空跑（事件日志无新增、RTP 窗口 n/a）。
 - 证据：`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`。
