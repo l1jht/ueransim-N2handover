@@ -151,7 +151,7 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 
 ### 8.2 v2.2：Handover Cancel（C5，2026-10-01）
 
-- 实现（commit `5aacad9`，补丁 3553 行）：源侧 TNGRELOCprep 超时发起 `Handover Cancel`（AMF/RAN UE NGAP ID 自动附加，cause=tngrelocprep expiry）+ `Handover Cancel Acknowledge` 处理（缺失按 §8.4.5.4 视为成功）；目标侧容忍处理 `Handover Cancel`（释放 pending + 转发 TEUNDOWN）；预置上下文被 AMF 释放时同步清理；迟到 `Handover Command`/`Preparation Failure` 忽略；
+- 实现（commit `5aacad9`，补丁 3553 行）：源侧 TNGRELOCprep 超时发起 `Handover Cancel`（AMF/RAN UE NGAP ID 自动附加，cause=tngrelocprep expiry）+ `Handover Cancel Acknowledge` 处理（缺失按 §8.4.5.4 视为成功）；目标侧容忍处理 `Handover Cancel`（释放 pending + 转发 TEARDOWN）；预置上下文被 AMF 释放时同步清理；迟到 `Handover Command`/`Preparation Failure` 忽略；
 - **free5GC 实测**（无效目标 gNB[9] 触发 prep 超时）：源 `Handover Cancel sent for UE[2] (cause: TNGRELOCprep expiry)` → AMF `Handle HandoverCancel`（cause RadioNetwork[10]=tngrelocprep-expiry）→ **AMF 陈旧 "N2 handover is ongoing" 状态被清除**（重启 UE 后免重启核心即恢复注册）；AMF 未回 Ack（其 inter-AMF 分支未实现，规范允许缺失 Ack）；
 - 正常切换路径：无 Cancel 消息（无回归）；共存矩阵三场景全绿（1/1、2/2、2/2）；
 - 未 E2E 触发（代码就位）：目标侧容忍 Cancel、预置上下文释放清理（仿真中无对应场景）。
