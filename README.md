@@ -2,7 +2,7 @@
 
 在 [UERANSIM](https://github.com/aligungr/UERANSIM) **v3.3.0** 上以**补丁**形式实现的 **N2 切换（NG-RAN 间 N2-based Handover）仿真**功能：由 `nr-cli` 触发，源 gNB 经 N2（NGAP）向 5GC 发起切换，目标 gNB 分配资源，UE 完成"空口"重配并迁移，5GC 完成路径切换与源侧释放。
 
-参考规范：TS 23.502 §4.9.1.3（Preparation/Execution）、TS 38.413 §8.4（Handover Preparation / Resource Allocation / Notification）、TS 23.501、TS 38.300。
+参考规范：TS 23.502 §4.9.1.3/§4.9.1.4（Preparation/Execution/Cancel）、TS 38.413 §8.4（Handover Preparation / Resource Allocation / Notification / Cancellation）、§8.3.3.4、§9.6、TS 23.501、TS 38.300 §9.2.3.2。**规范原文核对**见 `docs/STANDARDS-AUDIT.md`。
 
 ## 特性
 
@@ -10,13 +10,13 @@
 - **准备阶段完整**：目标 gNB 收到 **Handover Request** 后逐 PDU 会话分配下行 N3 端点（TEID），返回 **Handover Request Acknowledge**（Admitted/Failed 列表、Target-To-Source 透明容器）；全部会话被拒时返回 **Handover Failure**
 - **执行阶段完整**：源 gNB 收到 **Handover Command** 后向 UE 下发 RRC Reconfiguration（承载切换命令）；UE 按 **NCI** 解析目标小区并迁移（保持 RRC_CONNECTED），向目标 gNB 发送 RRC Reconfiguration Complete；目标 gNB 发送 **Handover Notify**；5GC 完成下行路径切换后源 gNB 收到 **UE Context Release Command** 并释放
 - **UE 侧 NAS**：切换后若 TAI 变化，按 TS 23.502 §4.9.1.3.3 步骤 12 触发**移动性注册更新**（默认配置两个 gNB 同 TAC，不触发；跨 TAC 场景需将目标 TAC 纳入 AMF 支持列表，属扩展用法，未做端到端验证）
-- **失败与异常**：Handover Preparation Failure 记录原因；目标侧 pending 切换超时自动清理；目标 gNB 部分会话失败时按规范返回 Failed 列表
+- **失败与异常**：Handover Preparation Failure 记录原因（迟到消息在无 pending 准备时忽略）；目标侧 pending 切换超时自动清理；目标 gNB 部分会话失败时按规范返回 Failed 列表并由源侧释放；**TNGRELOCprep 超时发起 Handover Cancel**（v2.2；含 Cancel Ack 处理与目标侧容忍释放）；TNGRELOCoverall 超时按规范 cause 请求释放
 - **可重复切换**：支持 gNB1 ⇄ gNB2 反复切换（陈旧 UE 上下文、GTP DL TEID 替换均处理）
 - **仿真身份设计**：以 RLS **STI**（UE 的"空口"稳定标识）跨 gNB 标识 UE，以 **NCI** 让 UE 定位目标小区——不依赖节点顺序/ID 巧合（修复了社区 PR 方案中的脆弱假设）
 - **确定性小区选择**：同信号强度时按较小 NCI 择先，保证初始驻留与切换演示可复现
-- **基础数据面**：UL 在 UE 迁移后立即经目标 gNB（NL 转 N3）；DL 在 5GC 路径切换后恢复。**不实现** gNB 间转发隧道（见"简化点"）
+- **数据转发（v2/v2.1）**：源侧把切换窗口内 DL 重定向到 Handover Command 给出的转发 TNL（直连/间接两种核心网口味统一处理；封装携带 UL 变体 PDU Session Container/QFI）；目标侧接收/缓存（256 包 / 1 MB，丢最旧）并在 UE 到达后按序交付；目标公告的转发 TEID 保留为**会话寿命别名**；**End Marker 转发**、**per-flow `dataForwardingAccepted`**、**`DataForwardingNotPossible` 处理**、**失败会话列表释放**（v2.1）
 - **结构化事件日志**：每个 gNB 写 `logs/<gnb-name>.ho-events.jsonl`（JSONL；`ho_id` 贯通源/目标、阶段枚举、单调/挂钟时间戳），零新增配置项、服务无关；配套 `deploy/ho-batch.sh` 批量往返驱动
-- **单元测试**：`ctest` 覆盖透明容器编解码（边界/非法输入）、确定性小区排序、目标小区解析、事件序列化
+- **单元测试**：`ctest`（23 项）覆盖透明容器编解码（边界/非法输入）、确定性小区排序、目标小区解析、事件序列化、转发缓冲（FIFO/上限/丢最旧）
 - **与 ueransim-ims 补丁共存**：两种 apply 顺序均可干净应用，编译通过，双测试套件（`ims-tests` + `ho-tests`）全绿
 
 ## 与 3GPP 流程的对应
@@ -69,7 +69,7 @@ ueransim-N2handover/
 │   │   ├── provision.sh                 Open5GS + pyHSS 开户
 │   │   ├── run-ims-test.sh              一键验收（通话 + N 次往返切换 + RTP 缺口 + 控制面耗时 + 事件相关性）
 │   │   ├── tweaks/apply-open5gs-tweaks.sh  测试床环境适配（3 处，幂等）
-│   │   └── evidence/ims-handover-summary.txt  实测证据摘要
+│   │   └── evidence/                     实测证据（v1 基线 + v2/v2.1 转发验收）
 │   └── free5gc-ims/                     free5GC + IMS 测试床（方案 L）与双核对比
 │       ├── README.md                    部署/开户/验收步骤、排错（NSSF/重复会话/NAT 抓包）
 │       ├── docker-compose.ueransim.yaml UERANSIM 侧 overlay（两 gNB 两 UE）
@@ -78,13 +78,14 @@ ueransim-N2handover/
 │       ├── env.free5gc                  IMS 侧 .env（free5GC 网络参数）
 │       ├── provision-free5gc-ims.sh     开户（WebUI 含 ims/SmPolicyData + pyHSS）
 │       ├── tweaks/apply-free5gc-ims-tweaks.sh  幂等适配（free5GC 侧 + IMS 侧 N5 关闭）
-│       └── evidence/                    实测证据（汇总/CSV/压缩抓包/双核对比）
+│       └── evidence/                    实测证据（汇总/CSV/压缩抓包/双核对比 + v2/v2.1/v2.2 验收）
 └── docs/
     ├── ARCHITECTURE.md          实现架构、仿真身份设计、与规范的对应与简化点
     ├── BUILD.md                 构建（含与 ueransim-ims 补丁共存的验证）
     ├── RUN.md                   端到端运行（free5GC/Open5GS）、触发切换、验证与排错
     ├── MEASUREMENT.md           事件日志 schema、批量驱动、IMS 连续性取证方法
-    └── REGRESSION.md            本地回归测试记录（含基线对照实验）
+    ├── REGRESSION.md            本地回归测试记录（含基线对照实验）
+    └── STANDARDS-AUDIT.md       规范原文审计（38.413/23.502/38.300 逐条核对）
 ```
 
 ## 快速开始
@@ -122,6 +123,15 @@ ctest --output-on-failure
 | **Handover Cancel（v2.2，2026-10-01）** | ✅ 源侧 TNGRELOCprep 超时发起 Cancel（cause=tngrelocprep expiry）+ Ack 处理 + 目标侧容忍释放 + 预置上下文释放清理；free5GC 实测 AMF `Handle HandoverCancel` 并清除陈旧状态；正常路径无回归；规范审计见 `docs/STANDARDS-AUDIT.md` |
 
 > 规范依据核对：`docs/STANDARDS-AUDIT.md`（对 `docs/N2-handover.md` 基准文档的逐条原文审计，2026-10-01；38.413/23.502/38.300 原文逐字核对）。
+
+## 版本记录（v1 → v2.2）
+
+| 版本 | 内容 | 关键提交 |
+|---|---|---|
+| v1 | N2 切换控制面 + 基础用户面、结构化事件日志 | UERANSIM `e0112ad`/`ab6b021` |
+| v2 | 数据转发（源侧重定向 + 目标侧缓存/会话寿命别名）、TNGRELOCprep/overall、无开关 | UERANSIM `a41aca0`…`d0a2940`；交付仓 `1c13352` |
+| v2.1 | 标准对齐：`dataForwardingAccepted`、`DataForwardingNotPossible`、End Marker、失败会话列表、overall 超时 cause | UERANSIM `352983b`/`4e29d0e`；交付仓 `ff1ae9f`/`d76ea17` |
+| v2.2 | Handover Cancel（prep 超时发起 + Ack 处理 + 目标侧释放清理） | UERANSIM `5aacad9`；交付仓 `1ece982`/`d6afde7` |
 
 ## 简化点（重要）
 
