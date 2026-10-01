@@ -50,7 +50,7 @@
    **基线对照（C1）在未打补丁的 v3.3.0 上复现完全相同的日志与 100% 丢包**；本补丁未改动 `nnsf.cpp`（`selectAmf`）与 `extractSliceInfoAndPdu`。
    *规避*：重启 UE（重新注册，走带 NSSAI 的 Registration Request）即可恢复。
 2. **free5GC 侧释放/重建竞态**：`ps-release-all` 后立即 `ps-establish`，首次可能收到 `DNN_NOT_SUPPORTED_OR_NOT_SUBSCRIBED`（SMF 日志见 `Cause_REL_DUE_TO_DUPLICATE_SESSION_ID`），重传（T3580）后成功。属 5GC 内部状态处理，与本补丁无关。
-3. **GTP-U End Marker（类型 254）**：路径切换后 UPF 在旧路径发送 End Marker，UERANSIM 上游 GTP 任务未实现该消息，记录 `Unhandled GTP-U message type: 254`。这是"不实现 gNB 间转发"简化的直接结果（End Marker 无需转发时可直接忽略），不影响数据面。
+3. **GTP-U End Marker（类型 254）**：路径切换后 UPF 在旧路径发送 End Marker。v1（不转发）记录 `Unhandled GTP-U message type: 254`；**v2.1 起源侧转发进转发隧道（`end marker forwarded ...`）、目标侧记录 `end marker received ... (forwarding complete)`**，不再出现未处理日志（无 PDCP 重排序，语义从简，见 `ARCHITECTURE.md` §6）。
 4. **孤立 NGAP 上下文**：AMF 选择失败/释放等场景会在 `ue-list` 留下 `amf-ngap-id: -1` 的孤儿上下文（上游无清理路径）。RLS UE ID 单调递增、永不复用，且本补丁的 UE 匹配以 STI 为准，因此孤儿上下文**无害**（重启 gNB 即消失）。
 5. **STI 会在重连后变化**：UE 重新建立 RRC 时更新 STI（`RESET_STI`）。本实现每次切换触发时从 RLS 实时读取当前 STI 并以透明容器传递，因此天然兼容。
 
