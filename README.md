@@ -129,5 +129,5 @@ UERANSIM 仿真"空口"，因此以下内容按仿真方式实现或有意省略
 
 - 透明容器内的 RRC 载荷为**仿真自定义格式**（标准 NGAP 信封不变）；无 AS 安全
 - **已实现 gNB 间数据转发**（v2，2026-10-01）：源侧重定向 + 目标侧接收/缓存/会话寿命别名；直连与间接两种核心网口味统一处理；转发封装按隧道方向携带 UL 变体 PDU Session Container（QFI）
-- **不做** RAN Status Transfer / PDCP SN 保持、DAPS、Handover Cancel、AMF 重定位
+- **不做** RAN Status Transfer / PDCP SN 保持、DAPS、AMF 重定位（**Handover Cancel 已实现**，见 `docs/RUN.md` §12）
 - 触发方式为 CLI（代替测量报告）；目标小区 NCI 由目标 gNB ID 按约定推导

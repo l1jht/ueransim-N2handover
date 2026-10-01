@@ -15,7 +15,7 @@
 | `src/gnb/ngap/handover.cpp` | gNB 侧 NGAP 切换过程：`sendHandoverRequired`（源）、`receiveHandoverRequest`（目标，资源分配+回 Ack/Failure）、`receiveHandoverCommand`（源）、`handleHandoverConfirm`、`sendHandoverNotify`、失败/超时清理 |
 | `src/gnb/rrc/handover.cpp` | gNB RRC：把切换命令封装为 RRC Reconfiguration 下发；接收 RRC Reconfiguration Complete 并通知 NGAP |
 | `src/ue/rrc/handover.cpp` | UE RRC：解析切换命令、按 NCI 解析目标小区、切换服务小区（`ASSIGN_CURRENT_CELL`）、发送 RRC Reconfiguration Complete、通知 NAS |
-| `tests/handover/CMakeLists.txt`、`tests/handover/ho_tests.cpp` | 单元测试（14 项） |
+| `tests/handover/CMakeLists.txt`、`tests/handover/ho_tests.cpp` | 单元测试（23 项，含转发缓冲 9 项） |
 
 主要修改文件：
 
@@ -117,7 +117,8 @@
 | 执行 5：Handover Notify | ✅ 自动附加 AMF-UE-NGAP-ID / RAN-UE-NGAP-ID / UserLocationInformation（复用既有 `sendNgapUeAssociated`） |
 | 执行 12：移动性注册更新 | ✅ TAI 变化时 UE NAS 触发（`ENTER_UNLISTED_TRACKING_AREA`）；同 TAC 时不触发 |
 | 执行 14：UE Context Release | ✅ 复用既有 `receiveContextRelease`（GTP 会话释放、RRC 释放） |
-| 失败：Preparation Failure | ✅ 源侧记录 cause（不做自动重试） |
+| 失败：Preparation Failure | ✅ 源侧记录 cause（不做自动重试）；迟到消息在无 pending 准备时忽略 |
+| 取消：Handover Cancel | ✅ TNGRELOCprep 超时发起（cause=tngrelocprep expiry）；处理 Cancel Ack（缺失按 §8.4.5.4 视为成功）；目标侧容忍释放 + 预置上下文释放清理 |
 
 ## 6. 简化点与偏差（相对规范）
 
@@ -127,7 +128,7 @@
 | 2 | 触发为 CLI（代替测量报告/无线原因判断） | 仿真触发手段 |
 | 3 | 转发为**会话级**（非 QoS 流级）；无 PDCP SN/重排序（FIFO 缓存 + "flush 先于新数据"）；End Marker 转发（源）/记录（目标），无重排序语义（v2.1） | 仿真中 QoS 流级与 PDCP 重排序不可观测；转发与 per-flow `dataForwardingAccepted` 已实现（v2/v2.1，2026-10-01） |
 | 4 | 不实现 RAN Status Transfer / PDCP SN 与 HFN 保持 | 无损切换语义不模拟 |
-| 5 | 不实现 DAPS、Handover Cancel、Handover Success | 基础场景之外 |
+| 5 | 不实现 DAPS、Handover Success | 基础场景之外；**Handover Cancel 已实现**（见 §5 与 §6-6） |
 | 6 | TNGRELOCprep/TNGRELOCoverall 已实现（常数 5 s / 10 s）；prep 超时发起 **Handover Cancel**（含 Cancel Ack 处理与目标侧容忍释放）；overall 超时停止转发并按规范 cause 请求释放 | TS 38.413 §8.4.1.2 / §8.3.3.4 / §8.4.5 |
 | 7 | 目标小区 NCI 由 gNB ID 约定推导（见 §3.4） | 仿真中替代 ANR/OAM |
 | 8 | 假定两 gNB 同 PLMN/TAC（TargetID 的 selectedTAI 用源侧配置） | 基础场景；跨 PLMN/TAC 需扩展 |

@@ -112,13 +112,15 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 
 ## 7. 结论
 
+> **v2.2 终态（2026-10-01）**：数据转发（v2/v2.1）与 Handover Cancel（v2.2）已实现并双核/单核验证；N2 切换的全部消息级过程与标准对齐；剩余项（C6a/C6b/C7、N2、L1–L5）经评估保持文档化或按需，排除项维持。
+
 - 补丁**未引入对既有功能的回归**（含基线对照验证）；
 - N2 切换的正常路径（单 UE / 多 UE / 多 PDU 会话 / 反复切换）与失败路径（Preparation Failure）均按规范行为工作；
 - 观察 1–5 已记录，其中 1 为上游限制（有基线证据）、2 为 5GC 侧竞态、3–5 为已知简化的自然表现。
 
 ## 8. v2 数据转发回归（2026-10-01）
 
-**包级（干净 v3.3.0，三个场景重跑）**：仅 n2 / ims→n2 / n2→ims 均 apply + 构建通过；ctest 1/1、2/2、2/2；补丁 3334 行（v1 2573）。
+**包级（干净 v3.3.0，三个场景重跑）**：仅 n2 / ims→n2 / n2→ims 均 apply + 构建通过；ctest 1/1、2/2、2/2；补丁 **3553 行**（v1 2573；v2.2 终版）。
 
 **功能级（两核 IMS 通话中切换，各 10 次往返 / 20 次切换）**：
 
@@ -143,7 +145,7 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 - 变更（commit `352983b`，补丁 3452 行）：C1 per-flow `dataForwardingAccepted`；C2 尊重 `DataForwardingNotPossible`（不公告转发端点）；C3 End Marker 转发（源）/记录（目标）；C4 失败会话列表解析与本地释放；
 - free5GC 复验（10 次往返/20 次切换）：通话 20/20 CONFIRMED；RTP max ue1 DL 38.1 / UL 41.1 ms、>60 ms 中断 0；ue1 计数差 1 包；**end marker 20/20 转发并接收、`Unhandled GTP-U` 归零**；
 - 多 UE 并发切换（ue1+ue2 先后切出再切回）：双向 ping 0% 丢包、每 UE 独立 STI/TEID、无交叉；无 `TEID not found`；
-- 失败路径（确定性）：切换到不存在的目标 gNB[9] → 源侧 `Handover Required sent` 后 5 s **TNGRELOCprep 超时本地中止**（不发 Cancel，文档化偏差）、**未建立转发**、UE 驻留源侧；free5GC AMF 对无效 TargetID 未回 PreparationFailure（核心网行为）；
+- 失败路径（确定性）：切换到不存在的目标 gNB[9] → 源侧 `Handover Required sent` 后 5 s **TNGRELOCprep 超时 → 发起 Handover Cancel + 本地中止**（v2.2 起；v2.1 时为本地中止）、**未建立转发**、UE 驻留源侧；free5GC AMF 对无效 TargetID 未回 PreparationFailure（核心网行为）；
 - 未在实测中触发（代码路径就位）：C2（核心网未置 `DataForwardingNotPossible`）、C4（无失败会话）；
 - 运维注记：验收脚本假定 ue1 起始在 GNB1；否则 `handover` 命令空跑（事件日志无新增、RTP 窗口 n/a）。
 - 证据：`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`；

@@ -167,7 +167,7 @@ Open5GS 的 UPF 为**用户态**（`ogstun`，无需 gtp5g 内核模块），部
 
 - 切换窗口内**有 gNB 间转发**（v2）：源侧把窗口内到达的 DL 重定向到 Handover Command 给出的转发 TNL；目标侧在自己公告的 TEID 上接收、缓存并在 UE 到达后按序交付；该 TEID 保留为**会话寿命别名**（部分核心网持续用它下发 DL）。End Marker 仍不转发（GTP 层记录 `Unhandled GTP-U message type: 254`）。
 - 触发方式为 CLI（代替测量报告）；两 gNB 需同 PLMN/TAC（或自行扩展）。
-- 不做 RAN Status Transfer / DAPS / Handover Cancel（见 `ARCHITECTURE.md` §6）。
+- 不做 RAN Status Transfer / DAPS（见 `ARCHITECTURE.md` §6）；**Handover Cancel 已实现**（TNGRELOCprep 超时发起，见 §12 与 `ARCHITECTURE.md` §6-6）。
 - `ue-release` 释放 UE 后，UE 由上行数据触发原地恢复（Service Request）受**上游 UERANSIM v3.3.0 的 `selectAmf` 限制**（无 Requested NSSAI 时无法选择 AMF，未打补丁基线同样如此）；**重启 UE** 可正常恢复。详见 `REGRESSION.md` 观察 1。
 
 ## 9. 实测记录（free5GC v4.2.3 容器）
