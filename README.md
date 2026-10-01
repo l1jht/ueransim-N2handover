@@ -120,6 +120,8 @@ ctest --output-on-failure
 | **数据转发（v2，2026-10-01）** | ✅ 已验证：free5GC/Open5GS 各 10 次往返（20 次切换）通话保持 CONFIRMED；UE 侧 `mediaTx/mediaRx` 差 0–3 包、RTP >60 ms 中断 0；源侧每切换转发 9–11 个 IMS 媒体包；证据 `deploy/*/evidence/*v2-forwarding*`；详见 `docs/RUN.md` §12 |
 | **标准对齐（v2.1，2026-10-01）** | ✅ C1 per-flow `dataForwardingAccepted`、C2 尊重 `DataForwardingNotPossible`、C3 End Marker 转发/接收、C4 失败会话列表；free5GC 20 次切换复验（计数差 1 包、>60 ms 中断 0、end marker 20/20、无未处理 GTP）+ 两 UE 并发切换隔离验证；证据 `deploy/free5gc-ims/evidence/*v21*` |
 
+> 规范依据核对：`docs/STANDARDS-AUDIT.md`（对 `docs/N2-handover.md` 基准文档的逐条原文审计，2026-10-01；38.413/23.502/38.300 原文逐字核对）。
+
 ## 简化点（重要）
 
 UERANSIM 仿真"空口"，因此以下内容按仿真方式实现或有意省略（详见 `docs/ARCHITECTURE.md` 第 6 节）：

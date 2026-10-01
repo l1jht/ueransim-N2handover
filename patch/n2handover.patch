@@ -667,10 +667,10 @@ index 95a43cf..e63cefb 100644
      w1->ueId = ue->ctxId;
 diff --git a/src/gnb/ngap/handover.cpp b/src/gnb/ngap/handover.cpp
 new file mode 100644
-index 0000000..cd3e9d9
+index 0000000..8cae012
 --- /dev/null
 +++ b/src/gnb/ngap/handover.cpp
-@@ -0,0 +1,1028 @@
+@@ -0,0 +1,1029 @@
 +//
 +// This file is a part of UERANSIM project.
 +// Copyright (c) 2023 ALİ GÜNGÖR.
@@ -1694,8 +1694,9 @@ index 0000000..cd3e9d9
 +    wFwd->ueId = ueId;
 +    m_base->gtpTask->push(std::move(wFwd));
 +
-+    // TS 38.413 8.3.3: the source NG-RAN node requests the AMF to release the UE context.
-+    sendContextRelease(ueId, NgapCause::RadioNetwork_unspecified);
++    // TS 38.413 8.3.3.4: the source NG-RAN node requests the AMF to release the UE context. The
++    // Radio Network Layer cause list provides the dedicated value for this case (38.413 9.3.1.2).
++    sendContextRelease(ueId, NgapCause::RadioNetwork_tngrelocoverall_expiry);
 +}
 +
 +} // namespace nr::gnb

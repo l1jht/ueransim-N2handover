@@ -146,4 +146,5 @@ P-CSCF 关闭 IPSec/TCP 监听、PCF `qos_profiles` + IMS PCC 规则；脚本
 - 失败路径（确定性）：切换到不存在的目标 gNB[9] → 源侧 `Handover Required sent` 后 5 s **TNGRELOCprep 超时本地中止**（不发 Cancel，文档化偏差）、**未建立转发**、UE 驻留源侧；free5GC AMF 对无效 TargetID 未回 PreparationFailure（核心网行为）；
 - 未在实测中触发（代码路径就位）：C2（核心网未置 `DataForwardingNotPossible`）、C4（无失败会话）；
 - 运维注记：验收脚本假定 ue1 起始在 GNB1；否则 `handover` 命令空跑（事件日志无新增、RTP 窗口 n/a）。
-- 证据：`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`。
+- 证据：`deploy/free5gc-ims/evidence/free5gc-ims-handover-summary-v21-standard-alignment.txt`；
+- v2.1a（同日）：TNGRELOCoverall 超时释放请求改用规范专用 cause（`RadioNetwork_tngrelocoverall_expiry`，38.413 §8.3.3.4/§9.3.1.2；commit `4e29d0e`）；规范原文审计见 `docs/STANDARDS-AUDIT.md`。
